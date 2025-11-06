@@ -115,15 +115,15 @@ def load_into_neon(df: pd.DataFrame):
     print(f"✅ Inserted {len(df)} rows into Neon table {TABLE}")
 
 def main():
-    if not should_run_now():
-        print("⏭️ Not market close window (NY). Exiting.")
-        return
-    try:
-        data = fetch_via_requests()
-    except Exception as e:
-        print(f"requests failed ({e}); trying Playwright fallback…")
-        data = fetch_via_playwright()
+    force = os.environ.get("FORCE_RUN", "").lower() == "true"
 
+    if not force and not should_run_now():
+        print("⏭️ Not market close window (NY), and FORCE_RUN is not enabled. Exiting.")
+        return
+
+    print("🚀 Running ingestion (force override:" if force else "⏱️ Running at market close...")
+    
+    data = fetch_via_requests()
     df = json_to_df(data)
     if df.empty:
         raise RuntimeError("Empty DataFrame from API.")
