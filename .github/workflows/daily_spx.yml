@@ -1,0 +1,30 @@
+name: Daily SPX → Neon
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"  # every 30 mins; script exits unless ~16:10 NY time
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run loader
+        env:
+          NEON_URL: ${{ secrets.NEON_URL }}
+          NEON_TABLE: spx_chain
+        run: |
+          python fetch_spx_to_neon.py
