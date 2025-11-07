@@ -27,4 +27,4 @@ jobs:
           NEON_URL: ${{ secrets.NEON_URL }}
           NEON_TABLE: spx_chain
         run: |
-          python fetch_spx_to_neon.py
+          python spx_to_neon_final.py
