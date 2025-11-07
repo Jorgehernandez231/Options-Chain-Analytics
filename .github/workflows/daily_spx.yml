@@ -1,9 +1,9 @@
-name: Daily SPX → Neon
+name: SPX → Neon (daily)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"  # every 30 mins; script exits unless ~16:10 NY time
-  workflow_dispatch:
+    - cron: "15 21 * * 1-5"   # 21:15 UTC ≈ 16:15 New York (Mon-Fri)
+  workflow_dispatch: {}        # allows manual "Run workflow"
 
 jobs:
   run:
@@ -12,19 +12,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
-          pip install -r requirements.txt
-          python -m playwright install --with-deps chromium
+          python -m pip install --upgrade pip
+          pip install requests pandas psycopg2-binary pytz
 
       - name: Run loader
         env:
           NEON_URL: ${{ secrets.NEON_URL }}
-          NEON_TABLE: spx_chain
         run: |
-          python spx_to_neon_final.py
+          python spx_chain_raw.py
