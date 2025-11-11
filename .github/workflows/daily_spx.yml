@@ -1,9 +1,9 @@
-name: SPX → Neon (daily)
+name: SPX to Neon (daily)
 
 on:
   schedule:
-    - cron: "17 21 * * 1-5"   # 23:15 UTC ≈ 16:15 New York (Mon-Fri)
-  workflow_dispatch: {}
+    - cron: "17 21 * * 1-5"
+  workflow_dispatch:
 
 jobs:
   run:
@@ -22,14 +22,17 @@ jobs:
           pip install -r requirements.txt
 
       - name: Create Streamlit secrets (runner only)
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p .streamlit
           cat > .streamlit/secrets.toml <<'EOF'
-N_URL="${{ secrets.N_URL }}"
-NEON_DB="${{ secrets.NEON_DB }}"
-NEON_USER="${{ secrets.NEON_USER }}"
-NEON_PASSWORD="${{ secrets.NEON_PASSWORD }}"
-EOF
+          N_URL="${{ secrets.N_URL }}"
+          NEON_DB="${{ secrets.NEON_DB }}"
+          NEON_USER="${{ secrets.NEON_USER }}"
+          NEON_PASSWORD="${{ secrets.NEON_PASSWORD }}"
+          EOF
+          echo "secrets.toml created."
 
       - name: Run importer
         run: python spx_to_neon_final.py
