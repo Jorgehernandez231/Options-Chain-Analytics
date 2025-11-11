@@ -255,7 +255,6 @@ with tabs[0]:
 
 
 # ---- Tab 2: OI & Volume ----
-# ---- Tab 2: OI & Volume ----
 with tabs[1]:
     st.subheader("Open Interest & Volume")
 
