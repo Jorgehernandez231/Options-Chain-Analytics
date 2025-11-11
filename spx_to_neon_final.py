@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values
-
+import streamlit as st
 
 NEON_URL = st.secrets["N_URL"]
 TABLE = "spx_chain"
