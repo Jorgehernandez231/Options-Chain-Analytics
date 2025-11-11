@@ -6,8 +6,9 @@ import pandas as pd
 from datetime import datetime, timezone
 import psycopg2
 from psycopg2.extras import execute_values
+import streamlit as st
 
-NEON_URL = "postgresql://neondb_owner:npg_JQ4KUj8XoNTm@ep-small-fire-agsc86td-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+NEON_URL = st.secrets["N_URL"]
 TABLE = "spx_chain"
 CHAIN_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
 
