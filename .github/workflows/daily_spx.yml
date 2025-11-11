@@ -26,4 +26,4 @@ jobs:
         env:
           NEON_URL: ${{ secrets.NEON_URL }}
         run: |
-          python spx_chain_raw.py
+          python spx_to_neon_final.py
