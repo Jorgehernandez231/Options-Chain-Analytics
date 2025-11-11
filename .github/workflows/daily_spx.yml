@@ -27,7 +27,7 @@ jobs:
           set -euo pipefail
           mkdir -p .streamlit
           cat > .streamlit/secrets.toml <<'EOF'
-          N_URL="${{ secrets.N_URL }}"
+          NEON_URL="${{ secrets.N_URL }}"
           NEON_DB="${{ secrets.NEON_DB }}"
           NEON_USER="${{ secrets.NEON_USER }}"
           NEON_PASSWORD="${{ secrets.NEON_PASSWORD }}"
