@@ -1,4 +1,6 @@
-requests
-pandas
+streamlit
 psycopg2-binary
-playwright
+pandas
+plotly
+requests
+numpy
