@@ -2,28 +2,36 @@ name: SPX → Neon (daily)
 
 on:
   schedule:
-    - cron: "15 21 * * 1-5"   # 21:15 UTC ≈ 16:15 New York (Mon-Fri)
+    - cron: "17 21 * * 1-5"   # 23:15 UTC ≈ 16:15 New York (Mon-Fri)
   workflow_dispatch: {}        # allows manual "Run workflow"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip 
-          pip install requests pandas psycopg2-binary pytz streamlit 
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run loader
-        env:
-          N_URL: ${{ secrets.N_URL }}
+      # ✅ ADD THIS BLOCK HERE
+      - name: Create Streamlit secrets (runner only)
         run: |
-          python spx_to_neon_final.py
+          mkdir -p .streamlit
+          cat > .streamlit/secrets.toml <<'EOF'
+N_URL = "${{ secrets.N_URL }}"
+NEON_DB = "${{ secrets.NEON_DB }}"
+NEON_USER = "${{ secrets.NEON_USER }}"
+NEON_PASSWORD = "${{ secrets.NEON_PASSWORD }}"
+EOF
+
+      # ✅ Now run your importer (your script)
+      - name: Run importer
+        run: python spx_to_neon_final.py

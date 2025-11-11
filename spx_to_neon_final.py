@@ -8,7 +8,7 @@ import psycopg2
 from psycopg2.extras import execute_values
 import streamlit as st
 
-NEON_URL = st.secrets["N_URL"]
+NEON_URL = st.secrets["NEON_URL"]
 TABLE = "spx_chain"
 CHAIN_URL = "https://cdn.cboe.com/api/global/delayed_quotes/options/_SPX.json"
 
