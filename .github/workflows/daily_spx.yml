@@ -24,6 +24,6 @@ jobs:
 
       - name: Run loader
         env:
-          NEON_URL: ${{ secrets.NEON_URL }}
+          N_URL: ${{ secrets.N_URL }}
         run: |
           python spx_to_neon_final.py
