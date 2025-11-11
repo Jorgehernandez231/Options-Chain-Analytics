@@ -3,7 +3,7 @@ name: SPX → Neon (daily)
 on:
   schedule:
     - cron: "17 21 * * 1-5"   # 23:15 UTC ≈ 16:15 New York (Mon-Fri)
-  workflow_dispatch: {}        # allows manual "Run workflow"
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -21,17 +21,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ ADD THIS BLOCK HERE
       - name: Create Streamlit secrets (runner only)
         run: |
           mkdir -p .streamlit
           cat > .streamlit/secrets.toml <<'EOF'
-N_URL = "${{ secrets.N_URL }}"
-NEON_DB = "${{ secrets.NEON_DB }}"
-NEON_USER = "${{ secrets.NEON_USER }}"
-NEON_PASSWORD = "${{ secrets.NEON_PASSWORD }}"
+N_URL="${{ secrets.N_URL }}"
+NEON_DB="${{ secrets.NEON_DB }}"
+NEON_USER="${{ secrets.NEON_USER }}"
+NEON_PASSWORD="${{ secrets.NEON_PASSWORD }}"
 EOF
 
-      # ✅ Now run your importer (your script)
       - name: Run importer
         run: python spx_to_neon_final.py
