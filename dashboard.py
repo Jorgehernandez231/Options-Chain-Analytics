@@ -11,6 +11,8 @@ from datetime import date, datetime, timezone, timedelta
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from urllib.parse import quote, unquote
 
+
+
 # ---------- Page / Theme ----------
 PX_TEMPLATE = "plotly_dark"
 st.set_page_config(page_title="SPX Terminal", layout="wide", initial_sidebar_state="collapsed")
@@ -19,7 +21,7 @@ st.title("SPX Terminal • Options")
 
 # ---------- DB ----------
 TABLE_LATEST = "spx_chain"       # latest snapshot table (normalized rows: cp in separate rows)
-TABLE_HIST   = "spx_chain_raw_hist"  # historical snapshots with run_date
+TABLE_HIST   = "spx_chain"  # historical snapshots with run_date
 def get_conn():
     return psycopg2.connect(
         host=st.secrets["DB_HOST"],
@@ -97,27 +99,35 @@ def set_url_state(state: dict):
 
 URL_DEFAULTS = get_url_state()
 
+
 # ---------- History helpers ----------
 @st.cache_data(ttl=180, show_spinner=False)
 def load_run_dates():
+    """
+    Return list of distinct run timestamps (run_ts) as Python datetime objects,
+    newest first.
+    """
     try:
-        df = q(f"SELECT DISTINCT run_date FROM {TABLE_HIST} ORDER BY run_date DESC")
-        return [r.strftime("%Y-%m-%d") if hasattr(r, "strftime") else str(r) for r in df["run_date"]]
+        df = q(f"SELECT DISTINCT run_ts FROM {TABLE_HIST} ORDER BY run_ts DESC")
+        return list(df["run_ts"])
     except Exception:
         return []
 
-def prev_run_date(dates, cur_date):
-    if not dates or cur_date not in dates: return None
-    idx = dates.index(cur_date)
-    return dates[idx+1] if idx+1 < len(dates) else None
+def prev_run_date(dates, cur_dt):
+    if not dates or cur_dt not in dates:
+        return None
+    idx = dates.index(cur_dt)
+    return dates[idx + 1] if idx + 1 < len(dates) else None
 
 @st.cache_data(ttl=180, show_spinner=False)
-def load_chain_by_run(run_date):
+def load_chain_by_run(run_ts):
     return q(f"""
-        SELECT run_ts, run_date, expiration_date, strike, cp, last, bid, ask, volume, oi, iv
+        SELECT run_ts, expiration_date, strike, cp, last, bid, ask, volume, oi, iv
         FROM {TABLE_HIST}
-        WHERE run_date = %s
-    """, (run_date,))
+        WHERE run_ts = %s
+        ORDER BY expiration_date, strike, cp
+    """, [run_ts])
+
 
 @st.cache_data(ttl=180, show_spinner=False)
 def load_chain_two_days(run_date_cur, run_date_prev):
@@ -151,19 +161,45 @@ def nearest_strike_iv(df, exp, spot):
 
 # ---------- Load initial data ----------
 dates = load_run_dates()
-c0,c1,c2 = st.columns([1,1,5])
-with c0:
-    use_hist = st.toggle("History", value=URL_DEFAULTS.get("use_hist", bool(dates)),
-                         help="Read from historical table")
-with c1:
+
+with st.sidebar:
+    st.subheader("History")
+
+    use_hist = st.checkbox(
+        "Use history",
+        value=URL_DEFAULTS.get("use_hist", bool(dates)),
+        help="Read from historical table",
+    )
+
+    # Default to the most recent snapshot
     default_idx = 0
-    if (use_hist and dates) and URL_DEFAULTS.get("run_date") in dates:
-        default_idx = dates.index(URL_DEFAULTS["run_date"])
-    chosen_date = st.selectbox("Run date (NY)", dates, index=default_idx) if (use_hist and dates) else None
+    url_run = URL_DEFAULTS.get("run_date")  # we store it as string in the URL
+
+    if (use_hist and dates) and url_run is not None:
+        for i, dt in enumerate(dates):
+            if str(dt) == url_run:
+                default_idx = i
+                break
+
+    if dates:
+        chosen_date = st.selectbox(
+            "Run timestamp (UTC)",
+            dates,
+            index=default_idx,
+            key="run_ts",
+            format_func=lambda x: x.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+    else:
+        st.caption("No history snapshots found in table spx_chain_raw_hist.")
+        chosen_date = None
+
 
 @st.cache_data(ttl=120, show_spinner=False)
 def load_latest():
     return q(f"SELECT run_ts, expiration_date, strike, cp, last, bid, ask, volume, oi, iv FROM {TABLE_LATEST}")
+
+df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
+
 
 df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
 if df.empty:
@@ -175,10 +211,18 @@ df["expiration_date"] = pd.to_datetime(df["expiration_date"]).dt.date
 for c in ["strike","last","bid","ask","iv","volume","oi"]:
     if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
 
-default_spot = df["last"].median(skipna=True)
-if not np.isfinite(default_spot):
-    default_spot = float(df["strike"].median())
+# ---- Better SPOT detection from the options chain (ATM strike proxy) ----
 
+if "volume" in df.columns and df["volume"].notna().any():
+    try:
+        # ATM = strike of highest volume option
+        atm_strike = float(df.loc[df["volume"].idxmax(), "strike"])
+    except Exception:
+        atm_strike = float(df["strike"].median(skipna=True))
+else:
+    atm_strike = float(df["strike"].median(skipna=True))
+
+default_spot = atm_strike
 # ---------- Top controls ----------
 c1,c2,c3,c4,c5 = st.columns([1,1,1,1,3])
 
@@ -205,7 +249,8 @@ with c5:
     exp_idx = 0
     if URL_DEFAULTS.get("exp") in expiries:
         exp_idx = expiries.index(URL_DEFAULTS["exp"])
-    exp = st.selectbox("Expiration", expiries, index=exp_idx)
+    exp = st.selectbox("Expiration", expiries, index=exp_idx, key="exp_top")
+
 
 mask = ((df["cp"].eq("C") & show_calls) | (df["cp"].eq("P") & show_puts)) & df["expiration_date"].eq(exp)
 dfe = df[mask].copy().sort_values("strike")
@@ -249,7 +294,7 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Volatility Skew")
     fig = px.scatter(dfe, x="strike", y="iv", color="cp", template=PX_TEMPLATE,
-                     title=f"IV vs Strike · {exp}")
+                     title=f"IV vs Strike · {exp}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     fig.update_traces(marker=dict(size=6, opacity=0.9))
     st.plotly_chart(fig, use_container_width=True)
 
@@ -261,7 +306,7 @@ with tabs[1]:
     # ── Controls (local to this tab) ───────────────────────────────────────────
     colc1, colc2, colc3 = st.columns([1, 2, 2])
     with colc1:
-        use_log = st.checkbox("Log scale (Y)", value=True,
+        use_log = st.checkbox("Log scale (Y)", value=False,
                               help="Helps when a few strikes dominate.")
     with colc2:
         pct_cap = st.slider("Clip at percentile", 90, 100, 99,
@@ -302,15 +347,16 @@ with tabs[1]:
     with colA:
         fig_oi = px.bar(
             oi_df, x="strike", y="oi_capped", color="cp", barmode="group",
-            template=PX_TEMPLATE, title="Open Interest by Strike"
+            template=PX_TEMPLATE, title="Open Interest by Strike", color_discrete_sequence=["#1E90FF", "#FF4500"]
         )
         fig_oi.update_yaxes(type="log" if use_log else "linear", title="OI")
         st.plotly_chart(fig_oi, use_container_width=True)
+        
 
     with colB:
         fig_vol = px.bar(
             vol_df, x="strike", y="vol_capped", color="cp", barmode="group",
-            template=PX_TEMPLATE, title="Volume by Strike (today)"
+            template=PX_TEMPLATE, title="Volume by Strike (today)", color_discrete_sequence=["#1E90FF", "#FF4500"]
         )
         fig_vol.update_yaxes(type="log" if use_log else "linear", title="Volume")
         st.plotly_chart(fig_vol, use_container_width=True)
@@ -351,9 +397,9 @@ with tabs[2]:
     colA, colB = st.columns(2)
     with colA:
         fig_g = px.line(curve, x="strike", y="gex", template=PX_TEMPLATE, title="GEX by Strike")
-        st.plotly_chart(fig_g, use_container_width=True)
+        st.plotly_chart(fig_g, use_container_width=True, color_discrete_sequence=["#1E90FF", "#FF4500"])
     with colB:
-        fig_c = px.line(curve, x="strike", y="cum_gex", template=PX_TEMPLATE, title="Cumulative GEX (zero-cross ≈ flip)")
+        fig_c = px.line(curve, x="strike", y="cum_gex", template=PX_TEMPLATE, title="Cumulative GEX (zero-cross ≈ flip)", color_discrete_sequence=["#1E90FF", "#FF4500"])
         if flip_strike is not None:
             fig_c.add_vline(x=flip_strike, line_dash="dash", line_width=2)
             fig_c.add_annotation(x=flip_strike, y=curve["cum_gex"].min(), text=f"Flip ~ {flip_strike:.1f}", showarrow=False, yshift=20)
@@ -369,7 +415,7 @@ with tabs[3]:
             atm_rows.append({"expiration_date": e, "atm_iv": iv_atm})
     term = pd.DataFrame(atm_rows).sort_values("expiration_date")
     fig_t = px.line(term, x="expiration_date", y="atm_iv", markers=True,
-                    template=PX_TEMPLATE, title="ATM IV Across Expirations")
+                    template=PX_TEMPLATE, title="ATM IV Across Expirations", color_discrete_sequence=["#1E90FF", "#FF4500"])
     st.plotly_chart(fig_t, use_container_width=True)
 
 # ---- Tab 5: Table ----
@@ -383,10 +429,32 @@ with tabs[5]:
     st.subheader("Multi-Expiry Skew Overlay (IV vs Strike or Moneyness)")
 
     exps_all = sorted(df["expiration_date"].unique())
-    default_multi = URL_DEFAULTS.get("ovr_exps") or exps_all[:min(6, len(exps_all))]
-    exps_sel = st.multiselect("Select expirations to overlay", exps_all, default=default_multi)
 
-    x_choice = st.radio("X-axis", ["Strike", "Moneyness (K/S)"], horizontal=True,
+    # If permalink has specific expiries, try to use them first
+    url_exps = URL_DEFAULTS.get("ovr_exps") or []
+    url_exps = [pd.to_datetime(x).date() for x in url_exps if x]
+
+    if url_exps:
+        # keep only those that actually exist in this dataset
+        default_multi = [e for e in exps_all if e in url_exps] or exps_all[:min(6, len(exps_all))]
+    else:
+        # otherwise: pick the 6 expirations with highest total volume
+        vol_by_exp = (
+            df.groupby("expiration_date")["volume"]
+            .sum(min_count=1)
+            .sort_values(ascending=False)
+        )
+        top_exps = list(vol_by_exp.index[:min(6, len(vol_by_exp))])
+        default_multi = top_exps
+
+    exps_sel = st.multiselect(
+        "Select expirations to overlay",
+        exps_all,
+        default=default_multi,
+        key="exp_overlay"
+    )
+
+    x_choice = st.radio("X-axis", ["Strike", "Moneyness (K/S)"], horizontal=True, key="xaxis_overlay",
                         index=(0 if URL_DEFAULTS.get("ovr_x","strike")=="strike" else 1))
     avg_cp = st.checkbox("Average Calls & Puts together", value=URL_DEFAULTS.get("ovr_avgcp", True),
                          help="If off, calls/puts drawn as separate series (line dashes).")
@@ -480,7 +548,7 @@ with tabs[6]:
     if cur.empty:
         st.info("No rows for selected date."); st.stop()
 
-    exp_sel = st.selectbox("Expiration", sorted(cur["expiration_date"].unique()))
+    exp_sel = st.selectbox("Expiration", sorted(cur["expiration_date"].unique()), key="exp_oi_change")
     key_cols = ["expiration_date","strike","cp"]
 
     cur_e = cur[cur["expiration_date"].eq(exp_sel)][key_cols + ["oi","volume","iv"]].rename(columns={"oi":"oi_cur","volume":"vol_cur","iv":"iv_cur"})
@@ -492,7 +560,7 @@ with tabs[6]:
 
     hm = merged.groupby(["strike","cp"], as_index=False)["oi_change"].sum()
     fig_hm = px.bar(hm, x="strike", y="oi_change", color="cp", barmode="group",
-                    template=PX_TEMPLATE, title=f"OI Change by Strike — {date_prev or '?'} → {date_cur}")
+                    template=PX_TEMPLATE, title=f"OI Change by Strike — {date_prev or '?'} → {date_cur}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     st.plotly_chart(fig_hm, use_container_width=True)
 
     topN = st.slider("Show top N absolute movers", 10, 200, 50, 5)
@@ -512,7 +580,7 @@ with tabs[7]:
     tilt["tilt"] = tilt["call_oi"] - tilt["put_oi"]
     tilt = tilt.sort_values("strike")
 
-    fig_tilt = px.bar(tilt, x="strike", y="tilt", template=PX_TEMPLATE, title=f"Net Tilt by Strike — {exp_tilt}")
+    fig_tilt = px.bar(tilt, x="strike", y="tilt", template=PX_TEMPLATE, title=f"Net Tilt by Strike — {exp_tilt}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     fig_tilt.add_hline(y=0, line_dash="dash")
     st.plotly_chart(fig_tilt, use_container_width=True)
     st.dataframe(tilt.tail(100), use_container_width=True, height=320)
@@ -604,9 +672,9 @@ with tabs[9]:
         st.info("No data for selected comparison dates."); st.stop()
 
     exp_opts = sorted(set(cur["expiration_date"].unique()).intersection(prv["expiration_date"].unique()))
-    exp_cmp = st.selectbox("Expiration", exp_opts)
+    exp_cmp = st.selectbox("Expiration", exp_opts, key="exp_cmp")
 
-    x_choice = st.radio("X-axis", ["Strike", "Moneyness (K/S)"], horizontal=True)
+    x_choice = st.radio("X-axis", ["Strike", "Moneyness (K/S)"], horizontal=True, key="xaxis_compare")
     avg_cp = st.checkbox("Average Calls & Puts together", value=True)
     show_smoothing = st.checkbox("LOWESS smoothing", value=False)
     if show_smoothing:
@@ -659,10 +727,10 @@ with tabs[9]:
 
     if avg_cp:
         fig = px.line(plot_df, x="xvar", y="iv", color="run_label", template=PX_TEMPLATE,
-                      title=f"IV Skew: {date_prev} vs {date_cur} — {exp_cmp}")
+                      title=f"IV Skew: {date_prev} vs {date_cur} — {exp_cmp}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     else:
         fig = px.line(plot_df, x="xvar", y="iv", color="run_label", line_dash="cp",
-                      template=PX_TEMPLATE, title=f"IV Skew: {date_prev} vs {date_cur} — {exp_cmp} (Calls vs Puts)")
+                      template=PX_TEMPLATE, title=f"IV Skew: {date_prev} vs {date_cur} — {exp_cmp} (Calls vs Puts)", color_discrete_sequence=["#1E90FF", "#FF4500"])
     fig.update_layout(xaxis_title=x_title, yaxis_title="Implied Volatility", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
