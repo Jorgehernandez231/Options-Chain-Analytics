@@ -67,15 +67,32 @@ def to_int(x):
     v = to_float(x)
     return int(v) if v is not None else None
 
+RETENTION_DAYS = 15
+
+
 def load(df):
     with psycopg2.connect(NEON_URL) as conn, conn.cursor() as cur:
+        # Ensure table exists
         cur.execute(SCHEMA_SQL)
-        cur.execute(f"TRUNCATE {TABLE};")
-        execute_values(cur,
+
+        # ❌ Remove the full TRUNCATE (we don't want to wipe all data anymore)
+        # cur.execute(f"TRUNCATE {TABLE};")
+
+        # 🧹 Delete only data older than 15 days (rolling window)
+        cur.execute(f"""
+            DELETE FROM {TABLE}
+            WHERE run_ts < NOW() - INTERVAL '{RETENTION_DAYS} days';
+        """)
+
+        # ✅ Insert new batch (today's snapshot)
+        execute_values(
+            cur,
             f"INSERT INTO {TABLE} VALUES %s",
             [tuple(r) for r in df.itertuples(index=False)]
         )
+
     print(f"✅ Inserted {len(df)} rows into Neon (raw format).")
+
 
 def main():
     print("Fetching data...")
