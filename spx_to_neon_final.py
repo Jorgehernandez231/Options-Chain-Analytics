@@ -67,7 +67,7 @@ def to_int(x):
     v = to_float(x)
     return int(v) if v is not None else None
 
-RETENTION_DAYS = 15
+RETENTION_DAYS = 3
 
 
 def load(df):
