@@ -10,6 +10,7 @@ import streamlit as st
 from datetime import date, datetime, timezone, timedelta
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from urllib.parse import quote, unquote
+from sqlalchemy import create_engine
 
 
 
@@ -22,20 +23,23 @@ st.title("SPX Terminal • Options")
 # ---------- DB ----------
 TABLE_LATEST = "spx_chain"       # latest snapshot table (normalized rows: cp in separate rows)
 TABLE_HIST   = "spx_chain"  # historical snapshots with run_date
-def get_conn():
-    return psycopg2.connect(
-        host=st.secrets["DB_HOST"],
-        dbname=st.secrets["DB_NAME"],
-        user=st.secrets["DB_USER"],
-        password=st.secrets["DB_PASS"],
-        sslmode=st.secrets.get("DB_SSLMODE", "require"),
-        port=5432,
-    )
+# ---------- DB using SQLAlchemy ----------
 
-@st.cache_data(ttl=180, show_spinner=False)
+@st.cache_resource
+def get_engine():
+    user = st.secrets["DB_USER"]
+    pwd  = st.secrets["DB_PASS"]
+    host = st.secrets["DB_HOST"]
+    db   = st.secrets["DB_NAME"]
+
+    url = f"postgresql+psycopg2://{user}:{pwd}@{host}:5432/{db}"
+    return create_engine(url, pool_pre_ping=True)
+
+@st.cache_data(ttl=180)
 def q(sql, params=None):
-    with get_conn() as conn:
-        return pd.read_sql(sql, conn, params=params)
+    engine = get_engine()
+    return pd.read_sql(sql, engine, params=params)
+
 
 # ---------- URL state (permalink) ----------
 def _to_bool(v, default=False):
@@ -58,7 +62,7 @@ def get_url_state():
     except Exception:
         qp = st.experimental_get_query_params()  # older
     s = {}
-    s["use_hist"]   = _to_bool(qp.get("hist", ["0"])[0], False)
+    s["use_hist"]   = _to_bool(qp.get("hist", ["1"])[0], True)
     s["run_date"]   = qp.get("d", [None])[0]
     s["spot"]       = _to_float(qp.get("S", [None])[0], None)
     s["r"]          = _to_float(qp.get("r", [None])[0], None)
@@ -126,7 +130,7 @@ def load_chain_by_run(run_ts):
         FROM {TABLE_HIST}
         WHERE run_ts = %s
         ORDER BY expiration_date, strike, cp
-    """, [run_ts])
+    """, (run_ts,))
 
 
 @st.cache_data(ttl=180, show_spinner=False)
@@ -168,7 +172,7 @@ with st.sidebar:
     use_hist = st.checkbox(
         "Use history",
         value=URL_DEFAULTS.get("use_hist", bool(dates)),
-        help="Read from historical table",
+        help="Keep always checked to select a past snapshot from history.",
     )
 
     # Default to the most recent snapshot
@@ -282,13 +286,36 @@ if st.sidebar.button("Update URL with current filters"):
     }
     set_url_state(state)
     st.sidebar.success("URL updated — copy it from the address bar.")
+    
+# ---------- Global Plot Helpers ----------
+
+def add_spot_line(fig, spot, x_is_moneyness=False):
+    """Add a vertical spot line to any Plotly figure."""
+    try:
+        s = float(spot)
+    except:
+        return fig
+
+    x_val = 1.0 if x_is_moneyness else s
+
+    fig.add_vline(
+        x=x_val,
+        line_dash="dot",
+        line_width=1,
+        line_color="cyan",
+        opacity=0.9,
+    )
+    return fig
+    
 
 # ---------- Tabs ----------
 tabs = st.tabs([
     "IV Skew", "OI & Volume", "Gamma (approx)", "Term Structure", "Table",
     "Skew Overlay (Multi-Expiry)", "OI Change (Flows)", "Positioning Tilt",
-    "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface"
+    "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface",
+    "Summary"
 ])
+
 
 # ---- Tab 1: IV Skew ----
 with tabs[0]:
@@ -296,6 +323,8 @@ with tabs[0]:
     fig = px.scatter(dfe, x="strike", y="iv", color="cp", template=PX_TEMPLATE,
                      title=f"IV vs Strike · {exp}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     fig.update_traces(marker=dict(size=6, opacity=0.9))
+    fig.update_layout(hovermode="x unified")
+    fig = add_spot_line(fig, spot)
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -350,6 +379,8 @@ with tabs[1]:
             template=PX_TEMPLATE, title="Open Interest by Strike", color_discrete_sequence=["#1E90FF", "#FF4500"]
         )
         fig_oi.update_yaxes(type="log" if use_log else "linear", title="OI")
+        fig_oi.update_layout(hovermode="x unified")
+        fig_oi = add_spot_line(fig_oi, spot)
         st.plotly_chart(fig_oi, use_container_width=True)
         
 
@@ -359,6 +390,8 @@ with tabs[1]:
             template=PX_TEMPLATE, title="Volume by Strike (today)", color_discrete_sequence=["#1E90FF", "#FF4500"]
         )
         fig_vol.update_yaxes(type="log" if use_log else "linear", title="Volume")
+        fig_vol.update_layout(hovermode="x unified")
+        fig_vol = add_spot_line(fig_oi, spot)
         st.plotly_chart(fig_vol, use_container_width=True)
 
 
@@ -368,55 +401,212 @@ with tabs[2]:
     CONTRACT_MULT = 100.0
     today = date.today()
 
+    # --- Controls for style/zoom ---
+    colg1, colg2 = st.columns([1, 1])
+    with colg1:
+        zoom_atm = st.checkbox("Zoom around Spot (±%)", value=True, key="gex_zoom")
+        band = st.slider("±% around Spot", 2, 50, 10, 1, disabled=not zoom_atm, key="gex_band")
+    with colg2:
+        scale_millions = st.checkbox("Show values in millions", value=True, key="gex_scale_mio")
+
+    # --- Base gamma calculation (same idea as before) ---
     g = dfe.copy()
     g["T"] = g["expiration_date"].apply(lambda d: yearfrac(today, d))
     g["sigma"] = pd.to_numeric(g["iv"], errors="coerce")
+
     g["gamma"] = g.apply(
         lambda r2: bs_gamma(spot, r2["strike"], r, r2["sigma"], r2["T"])
-        if (r2["sigma"] and r2["sigma"]>0 and r2["T"]>0) else 0.0,
+        if (r2["sigma"] and r2["sigma"] > 0 and r2["T"] > 0) else 0.0,
         axis=1
     )
-    g["gex"] = - g["gamma"] * g["oi"].fillna(0) * CONTRACT_MULT * (spot**2)
+    g["gex"] = -g["gamma"] * g["oi"].fillna(0) * CONTRACT_MULT * (spot ** 2)
 
-    curve = g.groupby("strike", as_index=False)["gex"].sum().sort_values("strike")
-    curve["cum_gex"] = curve["gex"].cumsum()
+    # Aggregate by strike / cp
+    grp = g.groupby(["strike", "cp"], as_index=False)["gex"].sum()
+    pivot = grp.pivot(index="strike", columns="cp", values="gex").fillna(0.0)
+    pivot = pivot.rename(columns={"C": "gamma_call", "P": "gamma_put"})
+    if "gamma_call" not in pivot.columns:
+        pivot["gamma_call"] = 0.0
+    if "gamma_put" not in pivot.columns:
+        pivot["gamma_put"] = 0.0
 
-    # Flip level ~ zero-cross of cum_gex
+    pivot["total_gamma"] = pivot["gamma_call"] + pivot["gamma_put"]
+    pivot["cum_gamma"] = pivot["total_gamma"].cumsum()
+    pivot = pivot.reset_index().sort_values("strike")
+
+    # --- Zoom around Spot like in your reference image ---
+    if zoom_atm and np.isfinite(float(spot)):
+        lo = float(spot) * (1 - band / 100.0)
+        hi = float(spot) * (1 + band / 100.0)
+        pivot = pivot[(pivot["strike"] >= lo) & (pivot["strike"] <= hi)]
+
+    if pivot.empty:
+        st.info("No strikes in the selected window for Gamma view.")
+        st.stop()
+
+    # --- Scale to millions so the axes are readable ---
+    y_title = "Gamma Exposure"
+    y2_title = "Cumulative Γ"
+    if scale_millions:
+        pivot[["gamma_call", "gamma_put", "total_gamma", "cum_gamma"]] = (
+            pivot[["gamma_call", "gamma_put", "total_gamma", "cum_gamma"]] / 1_000_000.0
+        )
+        y_title = "Gamma Exposure (millions)"
+        y2_title = "Cumulative Γ (millions)"
+
+    # --- Flip level from cumulative gamma zero-cross ---
     flip_strike = None
-    sgn = np.sign(curve["cum_gex"])
+    sgn = np.sign(pivot["cum_gamma"])
     change_idx = np.where(np.diff(sgn) != 0)[0]
     if len(change_idx):
         i = change_idx[0]
-        x0, y0 = curve.loc[i,   ["strike","cum_gex"]]
-        x1, y1 = curve.loc[i+1, ["strike","cum_gex"]]
+        x0, y0 = pivot.loc[i,   ["strike", "cum_gamma"]]
+        x1, y1 = pivot.loc[i+1, ["strike", "cum_gamma"]]
         if (y1 - y0) != 0:
-            flip_strike = float(x0 - y0*(x1-x0)/(y1-y0))
+            flip_strike = float(x0 - y0 * (x1 - x0) / (y1 - y0))
         else:
-            flip_strike = float(curve.loc[i, "strike"])
+            flip_strike = float(pivot.loc[i, "strike"])
 
-    colA, colB = st.columns(2)
-    with colA:
-        fig_g = px.line(curve, x="strike", y="gex", template=PX_TEMPLATE, title="GEX by Strike")
-        st.plotly_chart(fig_g, use_container_width=True, color_discrete_sequence=["#1E90FF", "#FF4500"])
-    with colB:
-        fig_c = px.line(curve, x="strike", y="cum_gex", template=PX_TEMPLATE, title="Cumulative GEX (zero-cross ≈ flip)", color_discrete_sequence=["#1E90FF", "#FF4500"])
-        if flip_strike is not None:
-            fig_c.add_vline(x=flip_strike, line_dash="dash", line_width=2)
-            fig_c.add_annotation(x=flip_strike, y=curve["cum_gex"].min(), text=f"Flip ~ {flip_strike:.1f}", showarrow=False, yshift=20)
-        st.plotly_chart(fig_c, use_container_width=True)
+    # --- Plot (bars + orange curve) ---
+    fig_gex = go.Figure()
+
+    # Bars for Call / Put / Total
+    fig_gex.add_bar(
+        x=pivot["strike"],
+        y=pivot["gamma_call"],
+        name="Γ Call",
+        marker_color="green",
+    )
+    fig_gex.add_bar(
+        x=pivot["strike"],
+        y=pivot["gamma_put"],
+        name="Γ Put",
+        marker_color="red",
+    )
+    fig_gex.add_bar(
+        x=pivot["strike"],
+        y=pivot["total_gamma"],
+        name="Total Γ",
+        marker_color="purple",
+        opacity=0.6,
+    )
+
+    # Cumulative curve (orange) on second y-axis
+    fig_gex.add_scatter(
+        x=pivot["strike"],
+        y=pivot["cum_gamma"],
+        name="Curve Γ (cum)",
+        mode="lines",
+        line=dict(color="orange", width=2),
+        yaxis="y2",
+    )
+
+    # Flip vertical line
+    if flip_strike is not None:
+        fig_gex.add_vline(
+            x=flip_strike,
+            line_dash="dash",
+            line_width=2,
+            line_color="white",
+        )
+        fig_gex.add_annotation(
+            x=flip_strike,
+            y=pivot["cum_gamma"].min(),
+            text=f"Flip ~ {flip_strike:.0f}",
+            showarrow=False,
+            yshift=20,
+        )
+
+    # Optional: line at Spot
+    if np.isfinite(float(spot)):
+        fig_gex.add_vline(
+            x=float(spot),
+            line_dash="dot",
+            line_width=1,
+            line_color="yellow",
+        )
+
+    fig_gex.update_layout(
+        template=PX_TEMPLATE,
+        title="Gamma by Strike (Calls / Puts / Total) + Cumulative Curve",
+        barmode="group",  # clearer separation of green/red/purple
+        hovermode="x unified",
+        xaxis=dict(title="Strike"),
+        yaxis=dict(title=y_title),
+        yaxis2=dict(
+            title=y2_title,
+            overlaying="y",
+            side="right",
+            showgrid=False,
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+
+    st.plotly_chart(fig_gex, use_container_width=True)
+
+
 
 # ---- Tab 4: Term Structure ----
 with tabs[3]:
     st.subheader("ATM IV Term Structure")
+
+    today = date.today()
+
+    # --- Controls ---
+    col_ts1, col_ts2 = st.columns(2)
+    with col_ts1:
+        max_dte = st.slider(
+            "Max days to expiration",
+            min_value=30,
+            max_value=3650,
+            value=730,  # default: 2 years
+            step=30,
+            key="ts_max_dte",
+        )
+    with col_ts2:
+        clip_outliers = st.checkbox(
+            "Clip extreme IV outliers (percentile cap)",
+            value=True,
+            key="ts_clip",
+            help="Useful if a single bad IV print distorts the chart.",
+        )
+
+    # --- Build ATM IV per expiration ---
     atm_rows = []
     for e in sorted(df["expiration_date"].unique()):
         iv_atm = nearest_strike_iv(df, e, float(spot))
         if np.isfinite(iv_atm):
-            atm_rows.append({"expiration_date": e, "atm_iv": iv_atm})
-    term = pd.DataFrame(atm_rows).sort_values("expiration_date")
-    fig_t = px.line(term, x="expiration_date", y="atm_iv", markers=True,
-                    template=PX_TEMPLATE, title="ATM IV Across Expirations", color_discrete_sequence=["#1E90FF", "#FF4500"])
+            dte = max((e - today).days, 0)
+            atm_rows.append({"expiration_date": e, "dte": dte, "atm_iv": iv_atm})
+
+    term = pd.DataFrame(atm_rows)
+    if term.empty:
+        st.info("No ATM IV data available for term structure.")
+        st.stop()
+
+    # Filter by max DTE
+    term = term[term["dte"] <= max_dte].sort_values("dte")
+
+    # Optional outlier clipping
+    if clip_outliers and term["atm_iv"].notna().any():
+        hi = float(np.nanpercentile(term["atm_iv"], 98))
+        term["atm_iv"] = term["atm_iv"].clip(upper=hi)
+
+    # Plot using DTE on x-axis
+    fig_t = px.line(
+        term,
+        x="dte",
+        y="atm_iv",
+        markers=True,
+        template=PX_TEMPLATE,
+        title="ATM IV Across Expirations",
+        labels={"dte": "Days to Expiration", "atm_iv": "ATM IV"},
+        color_discrete_sequence=["#1E90FF"],
+    )
+
+    fig_t.update_layout(hovermode="x unified")
     st.plotly_chart(fig_t, use_container_width=True)
+
 
 # ---- Tab 5: Table ----
 with tabs[4]:
@@ -561,6 +751,8 @@ with tabs[6]:
     hm = merged.groupby(["strike","cp"], as_index=False)["oi_change"].sum()
     fig_hm = px.bar(hm, x="strike", y="oi_change", color="cp", barmode="group",
                     template=PX_TEMPLATE, title=f"OI Change by Strike — {date_prev or '?'} → {date_cur}", color_discrete_sequence=["#1E90FF", "#FF4500"])
+    fig_hm.update_layout(hovermode="x unified")
+    fig_hm = add_spot_line(fig_hm, spot)
     st.plotly_chart(fig_hm, use_container_width=True)
 
     topN = st.slider("Show top N absolute movers", 10, 200, 50, 5)
@@ -582,6 +774,8 @@ with tabs[7]:
 
     fig_tilt = px.bar(tilt, x="strike", y="tilt", template=PX_TEMPLATE, title=f"Net Tilt by Strike — {exp_tilt}", color_discrete_sequence=["#1E90FF", "#FF4500"])
     fig_tilt.add_hline(y=0, line_dash="dash")
+    fig_tilt.update_layout(hovermode="x unified")
+    fig_tilt = add_spot_line(fig_tilt, spot)
     st.plotly_chart(fig_tilt, use_container_width=True)
     st.dataframe(tilt.tail(100), use_container_width=True, height=320)
 
@@ -759,3 +953,164 @@ with tabs[10]:
         height=700
     )
     st.plotly_chart(fig, use_container_width=True)
+
+# ---- Tab 12: Summary (Volume, OI, Gamma, GEX) ----
+with tabs[11]:
+    st.subheader("Daily Summary by Expiration (Volume, OI, Gamma, GEX)")
+
+    all_dates = load_run_dates()
+    if not all_dates:
+        st.info("History table not available.")
+        st.stop()
+
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        max_n = len(all_dates)
+        n_rows = st.slider(
+            "Number of snapshots (most recent)",
+            min_value=5,
+            max_value=max_n,
+            value=min(25, max_n),
+            step=1,
+            key="summary_n",
+        )
+    with col2:
+        exp_mode = st.selectbox(
+            "Expiration mode",
+            ["All expirations", "Front expiration only"],
+            key="summary_exp_mode",
+        )
+
+    scale_millions = st.checkbox(
+        "Show values in millions",
+        value=True,
+        key="summary_scale_mio",
+    )
+
+    CONTRACT_MULT = 100.0
+    r_used = r
+    spot_used = float(spot)
+
+    rows = []
+
+    selected_dates = all_dates[:n_rows]
+
+    for run_ts in selected_dates:
+        df_run = load_chain_by_run(run_ts).copy()
+        if df_run.empty:
+            continue
+
+        df_run["expiration_date"] = pd.to_datetime(df_run["expiration_date"]).dt.date
+        for c in ["strike", "iv", "volume", "oi"]:
+            if c in df_run.columns:
+                df_run[c] = pd.to_numeric(df_run[c], errors="coerce")
+
+        if df_run.empty:
+            continue
+
+        expirations_all = sorted(df_run["expiration_date"].unique())
+        if not expirations_all:
+            continue
+
+        if exp_mode == "Front expiration only":
+            expirations_use = expirations_all[:1]
+        else:
+            expirations_use = expirations_all
+
+        snapshot_day = run_ts.date()
+
+        for exp_date in expirations_use:
+            df_e = df_run[df_run["expiration_date"].eq(exp_date)].copy()
+            if df_e.empty:
+                continue
+
+            # Approximate underlying close using ATM strike (highest volume)
+            if df_e["volume"].notna().any():
+                try:
+                    atm_k = float(df_e.loc[df_e["volume"].idxmax(), "strike"])
+                except Exception:
+                    atm_k = float(df_e["strike"].median(skipna=True))
+            else:
+                atm_k = float(df_e["strike"].median(skipna=True))
+
+            # Volume & OI
+            vol_call = df_e.loc[df_e["cp"].eq("C"), "volume"].sum()
+            vol_put  = df_e.loc[df_e["cp"].eq("P"), "volume"].sum()
+            oi_call  = df_e.loc[df_e["cp"].eq("C"), "oi"].sum()
+            oi_put   = df_e.loc[df_e["cp"].eq("P"), "oi"].sum()
+
+            delta_oi = oi_call - oi_put
+            total_oi = oi_call + oi_put
+            ratio_oi = oi_call / total_oi if total_oi > 0 else float("nan")
+
+            # Gamma & GEX
+            df_e["T"] = df_e["expiration_date"].apply(lambda d: yearfrac(snapshot_day, d))
+            df_e["sigma"] = pd.to_numeric(df_e["iv"], errors="coerce")
+
+            df_e["gamma_unit"] = df_e.apply(
+                lambda r2: bs_gamma(spot_used, r2["strike"], r_used, r2["sigma"], r2["T"])
+                if (r2["sigma"] and r2["sigma"] > 0 and r2["T"] > 0) else 0.0,
+                axis=1,
+            )
+
+            df_e["gex"] = -df_e["gamma_unit"] * df_e["oi"].fillna(0) * CONTRACT_MULT * (spot_used ** 2)
+
+            call_gamma = df_e.loc[df_e["cp"].eq("C"), "gex"].sum()
+            put_gamma  = df_e.loc[df_e["cp"].eq("P"), "gex"].sum()
+            net_gex    = call_gamma + put_gamma
+
+            # Number of contracts (OI is shares → divide by 100)
+            contracts = total_oi / CONTRACT_MULT if CONTRACT_MULT else total_oi
+
+            # Gamma ratio
+            if abs(put_gamma) > 0:
+                gr_pc = abs(call_gamma) / abs(put_gamma)
+            else:
+                gr_pc = float("nan")
+
+            rows.append({
+                "Date": snapshot_day,
+                "Expiration": exp_date,
+                "Vol.Call": vol_call,
+                "Vol.Put": vol_put,
+                "OI.Call": oi_call,
+                "OI.Put": oi_put,
+                "Delta OI": delta_oi,
+                "OI Ratio": ratio_oi,
+                "Call Gamma": call_gamma,
+                "Put Gamma": put_gamma,
+                "Net GEX": net_gex,
+                "Contracts": contracts,
+                "Gamma Ratio (C/P)": gr_pc,
+                "Approx Close (ATM)": atm_k,
+            })
+
+    if not rows:
+        st.info("No data available to build the summary.")
+        st.stop()
+
+    summary_df = pd.DataFrame(rows).sort_values(["Date", "Expiration"], ascending=[False, True])
+
+    # Scale to millions
+    if scale_millions:
+        for col in [
+            "Vol.Call", "Vol.Put", "OI.Call", "OI.Put",
+            "Delta OI", "Call Gamma", "Put Gamma",
+            "Net GEX", "Contracts"
+        ]:
+            summary_df[col] = summary_df[col] / 1_000_000.0
+
+        summary_df = summary_df.rename(columns={
+            "Vol.Call": "Vol.Call (M)",
+            "Vol.Put": "Vol.Put (M)",
+            "OI.Call": "OI.Call (M)",
+            "OI.Put": "OI.Put (M)",
+            "Delta OI": "Delta OI (M)",
+            "Call Gamma": "Call Gamma (M)",
+            "Put Gamma": "Put Gamma (M)",
+            "Net GEX": "Net GEX (M)",
+            "Contracts": "Contracts (M)",
+        })
+
+    st.dataframe(summary_df, use_container_width=True, height=540)
+

@@ -67,7 +67,7 @@ def to_int(x):
     v = to_float(x)
     return int(v) if v is not None else None
 
-RETENTION_DAYS = 3
+RETENTION_DAYS = 4
 
 
 def load(df):
@@ -78,7 +78,7 @@ def load(df):
         # ❌ Remove the full TRUNCATE (we don't want to wipe all data anymore)
         # cur.execute(f"TRUNCATE {TABLE};")
 
-        # 🧹 Delete only data older than 15 days (rolling window)
+        # 🧹 Delete only data older than 4 days (rolling window)
         cur.execute(f"""
             DELETE FROM {TABLE}
             WHERE run_ts < NOW() - INTERVAL '{RETENTION_DAYS} days';
