@@ -2,7 +2,7 @@ name: SPX to Neon (daily)
 
 on:
   schedule:
-    - cron: "17 21 * * 1-5"
+    - cron: "20 21 * * 1-5"
   workflow_dispatch:
 
 jobs:
