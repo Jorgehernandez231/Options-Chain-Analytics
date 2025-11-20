@@ -320,12 +320,141 @@ tabs = st.tabs([
 # ---- Tab 1: IV Skew ----
 with tabs[0]:
     st.subheader("Volatility Skew")
-    fig = px.scatter(dfe, x="strike", y="iv", color="cp", template=PX_TEMPLATE,
-                     title=f"IV vs Strike · {exp}", color_discrete_sequence=["#1E90FF", "#FF4500"])
-    fig.update_traces(marker=dict(size=6, opacity=0.9))
-    fig.update_layout(hovermode="x unified")
-    fig = add_spot_line(fig, spot)
+
+    # ── Controls ─────────────────────────────────────────────────────────────
+    col_sk1, col_sk2, col_sk3 = st.columns([1, 1, 1])
+    with col_sk1:
+        x_choice = st.radio(
+            "X-axis",
+            ["Strike", "Moneyness (K/S)"],
+            index=0,
+            horizontal=True,
+            key="skew_xaxis",
+        )
+    with col_sk2:
+        show_smooth = st.checkbox(
+            "Show smoothed curve",
+            value=True,
+            key="skew_smooth",
+        )
+    with col_sk3:
+        band_pct = st.slider(
+            "ATM zoom (±%)",
+            min_value=0,
+            max_value=60,
+            value=0,  # 0 = no zoom
+            step=5,
+            key="skew_band",
+            help="If >0, only show strikes within ±% of Spot.",
+        )
+
+    # ── Base data ────────────────────────────────────────────────────────────
+    skew_df = dfe.copy()
+
+    # Optional ATM zoom around spot
+    if band_pct > 0 and np.isfinite(float(spot)):
+        lo = float(spot) * (1 - band_pct / 100.0)
+        hi = float(spot) * (1 + band_pct / 100.0)
+        skew_df = skew_df[(skew_df["strike"] >= lo) & (skew_df["strike"] <= hi)]
+
+    if skew_df.empty:
+        st.info("No strikes available for the selected zoom window.")
+        st.stop()
+
+    # Choose x variable (Strike or Moneyness)
+    if x_choice.startswith("Moneyness"):
+        skew_df["xvar"] = skew_df["strike"].astype(float) / float(spot)
+        x_label = "Moneyness (K/S)"
+        x_is_moneyness = True
+    else:
+        skew_df["xvar"] = skew_df["strike"].astype(float)
+        x_label = "Strike"
+        x_is_moneyness = False
+
+    # Size points by volume (liquidity)
+    vol = pd.to_numeric(skew_df["volume"], errors="coerce").fillna(0)
+    if vol.max() > 0:
+        size = 4 + 8 * (vol / vol.max())  # 4–12
+    else:
+        size = 6
+
+    # ── Scatter of raw IV points ─────────────────────────────────────────────
+    fig = px.scatter(
+        skew_df,
+        x="xvar",
+        y="iv",
+        color="cp",
+        template=PX_TEMPLATE,
+        title=f"IV vs {x_label} · {exp}",
+        color_discrete_sequence=["#1E90FF", "#FF4500"],  # C / P
+        labels={"iv": "Implied Volatility", "cp": "Side"},
+    )
+    fig.update_traces(marker=dict(size=size, opacity=0.9))
+    
+    for t in fig.data:
+        if t.mode == "markers":        # raw points
+            t.visible = "legendonly"   # hide but keep in legend
+    # ── Optional smoothed curves per side ────────────────────────────────────
+    if show_smooth:
+        for side, g_side in skew_df.groupby("cp"):
+            g_side = g_side.dropna(subset=["xvar", "iv"]).sort_values("xvar")
+            # Drop zero IVs to avoid vertical spikes
+            g_side = g_side[g_side["iv"] > 0]
+
+            if len(g_side) < 5:
+                continue
+
+            sm = lowess(
+                g_side["iv"].values,
+                g_side["xvar"].values,
+                frac=0.15,
+                return_sorted=True,
+            )
+
+            line_name = "C (smooth)" if side == "C" else "P (smooth)"
+            fig.add_scatter(
+                x=sm[:, 0],
+                y=sm[:, 1],
+                mode="lines",
+                name=line_name,
+                line=dict(width=2),
+                showlegend=True,
+            )
+
+    # ── Optional mid IV line (average of C & P at each x) ────────────────────
+    mids = (
+        skew_df.dropna(subset=["xvar", "iv"])
+        .groupby("xvar", as_index=False)["iv"]
+        .mean()
+        .sort_values("xvar")
+    )
+    if len(mids) >= 3:
+        fig.add_scatter(
+            x=mids["xvar"],
+            y=mids["iv"],
+            mode="lines",
+            name="IV mid",
+            line=dict(width=1, dash="dot", color="white"),
+            showlegend=True,
+            visible="legendonly",
+        )
+
+    # ── Layout & helpers ─────────────────────────────────────────────────────
+    fig.update_layout(
+        xaxis_title=x_label,
+        yaxis_title="Implied Volatility",
+        hovermode="x unified",
+        legend_title_text="Side",
+    )
+
+    # Spot line (strike or K/S = 1)
+    if x_is_moneyness:
+        fig = add_spot_line(fig, spot, x_is_moneyness=True)
+    else:
+        fig = add_spot_line(fig, spot)
+
     st.plotly_chart(fig, use_container_width=True)
+
 
 
 # ---- Tab 2: OI & Volume ----
@@ -391,7 +520,7 @@ with tabs[1]:
         )
         fig_vol.update_yaxes(type="log" if use_log else "linear", title="Volume")
         fig_vol.update_layout(hovermode="x unified")
-        fig_vol = add_spot_line(fig_oi, spot)
+        fig_vol = add_spot_line(fig_vol, spot)
         st.plotly_chart(fig_vol, use_container_width=True)
 
 
@@ -405,11 +534,13 @@ with tabs[2]:
     colg1, colg2 = st.columns([1, 1])
     with colg1:
         zoom_atm = st.checkbox("Zoom around Spot (±%)", value=True, key="gex_zoom")
-        band = st.slider("±% around Spot", 2, 50, 10, 1, disabled=not zoom_atm, key="gex_band")
+        band = st.slider("±% around Spot", 2, 50, 10, 1,
+                         disabled=not zoom_atm, key="gex_band")
     with colg2:
-        scale_millions = st.checkbox("Show values in millions", value=True, key="gex_scale_mio")
+        scale_millions = st.checkbox("Show values in millions",
+                                     value=True, key="gex_scale_mio")
 
-    # --- Base gamma calculation (same idea as before) ---
+    # --- Base gamma calculation ---
     g = dfe.copy()
     g["T"] = g["expiration_date"].apply(lambda d: yearfrac(today, d))
     g["sigma"] = pd.to_numeric(g["iv"], errors="coerce")
@@ -417,11 +548,11 @@ with tabs[2]:
     g["gamma"] = g.apply(
         lambda r2: bs_gamma(spot, r2["strike"], r, r2["sigma"], r2["T"])
         if (r2["sigma"] and r2["sigma"] > 0 and r2["T"] > 0) else 0.0,
-        axis=1
+        axis=1,
     )
     g["gex"] = -g["gamma"] * g["oi"].fillna(0) * CONTRACT_MULT * (spot ** 2)
 
-    # Aggregate by strike / cp
+    # --- Aggregate by strike / cp ---
     grp = g.groupby(["strike", "cp"], as_index=False)["gex"].sum()
     pivot = grp.pivot(index="strike", columns="cp", values="gex").fillna(0.0)
     pivot = pivot.rename(columns={"C": "gamma_call", "P": "gamma_put"})
@@ -430,11 +561,9 @@ with tabs[2]:
     if "gamma_put" not in pivot.columns:
         pivot["gamma_put"] = 0.0
 
-    pivot["total_gamma"] = pivot["gamma_call"] + pivot["gamma_put"]
-    pivot["cum_gamma"] = pivot["total_gamma"].cumsum()
     pivot = pivot.reset_index().sort_values("strike")
 
-    # --- Zoom around Spot like in your reference image ---
+    # --- Zoom around Spot for plotting ---
     if zoom_atm and np.isfinite(float(spot)):
         lo = float(spot) * (1 - band / 100.0)
         hi = float(spot) * (1 + band / 100.0)
@@ -443,6 +572,27 @@ with tabs[2]:
     if pivot.empty:
         st.info("No strikes in the selected window for Gamma view.")
         st.stop()
+
+    # --- Total gamma & cumulative gamma (in the zoomed window) ---
+    pivot["total_gamma"] = pivot["gamma_call"] + pivot["gamma_put"]
+    pivot["cum_gamma"] = pivot["total_gamma"].cumsum()
+
+    # --- Flip strike where Total Γ changes sign in this window ---
+    flip_strike = None
+    tg = pivot["total_gamma"].values
+    strikes = pivot["strike"].values
+
+    if len(tg) >= 2:
+        sgn = np.sign(tg)
+        change_idx = np.where(np.diff(sgn) != 0)[0]
+        if len(change_idx):
+            i = int(change_idx[0])
+            x0, y0 = strikes[i],     tg[i]
+            x1, y1 = strikes[i + 1], tg[i + 1]
+            if (y1 - y0) != 0:
+                flip_strike = float(x0 - y0 * (x1 - x0) / (y1 - y0))
+            else:
+                flip_strike = float(strikes[i])
 
     # --- Scale to millions so the axes are readable ---
     y_title = "Gamma Exposure"
@@ -453,19 +603,6 @@ with tabs[2]:
         )
         y_title = "Gamma Exposure (millions)"
         y2_title = "Cumulative Γ (millions)"
-
-    # --- Flip level from cumulative gamma zero-cross ---
-    flip_strike = None
-    sgn = np.sign(pivot["cum_gamma"])
-    change_idx = np.where(np.diff(sgn) != 0)[0]
-    if len(change_idx):
-        i = change_idx[0]
-        x0, y0 = pivot.loc[i,   ["strike", "cum_gamma"]]
-        x1, y1 = pivot.loc[i+1, ["strike", "cum_gamma"]]
-        if (y1 - y0) != 0:
-            flip_strike = float(x0 - y0 * (x1 - x0) / (y1 - y0))
-        else:
-            flip_strike = float(pivot.loc[i, "strike"])
 
     # --- Plot (bars + orange curve) ---
     fig_gex = go.Figure()
@@ -501,13 +638,13 @@ with tabs[2]:
         yaxis="y2",
     )
 
-    # Flip vertical line
+    # Flip vertical line (only if sign change exists)
     if flip_strike is not None:
         fig_gex.add_vline(
             x=flip_strike,
             line_dash="dash",
             line_width=2,
-            line_color="white",
+            line_color="yellow",
         )
         fig_gex.add_annotation(
             x=flip_strike,
@@ -517,19 +654,22 @@ with tabs[2]:
             yshift=20,
         )
 
-    # Optional: line at Spot
-    if np.isfinite(float(spot)):
+    # Spot line (cyan dotted)
+    try:
+        s_val = float(spot)
         fig_gex.add_vline(
-            x=float(spot),
+            x=s_val,
             line_dash="dot",
             line_width=1,
-            line_color="yellow",
+            line_color="cyan",
         )
+    except Exception:
+        pass
 
     fig_gex.update_layout(
         template=PX_TEMPLATE,
         title="Gamma by Strike (Calls / Puts / Total) + Cumulative Curve",
-        barmode="group",  # clearer separation of green/red/purple
+        barmode="group",
         hovermode="x unified",
         xaxis=dict(title="Strike"),
         yaxis=dict(title=y_title),
@@ -545,7 +685,6 @@ with tabs[2]:
     st.plotly_chart(fig_gex, use_container_width=True)
 
 
-
 # ---- Tab 4: Term Structure ----
 with tabs[3]:
     st.subheader("ATM IV Term Structure")
@@ -553,7 +692,7 @@ with tabs[3]:
     today = date.today()
 
     # --- Controls ---
-    col_ts1, col_ts2 = st.columns(2)
+    col_ts1, col_ts2 = st.columns([2, 1])
     with col_ts1:
         max_dte = st.slider(
             "Max days to expiration",
@@ -577,12 +716,17 @@ with tabs[3]:
         iv_atm = nearest_strike_iv(df, e, float(spot))
         if np.isfinite(iv_atm):
             dte = max((e - today).days, 0)
-            atm_rows.append({"expiration_date": e, "dte": dte, "atm_iv": iv_atm})
+            atm_rows.append(
+                {"expiration_date": e, "dte": dte, "atm_iv": iv_atm}
+            )
 
     term = pd.DataFrame(atm_rows)
     if term.empty:
         st.info("No ATM IV data available for term structure.")
         st.stop()
+
+    # Drop already-expired / same-day (dte == 0) – they often create that weird spike
+    term = term[term["dte"] > 0]
 
     # Filter by max DTE
     term = term[term["dte"] <= max_dte].sort_values("dte")
@@ -592,21 +736,57 @@ with tabs[3]:
         hi = float(np.nanpercentile(term["atm_iv"], 98))
         term["atm_iv"] = term["atm_iv"].clip(upper=hi)
 
-    # Plot using DTE on x-axis
-    fig_t = px.line(
+    # --- Maturity buckets for color ---
+    def bucket_dte(d):
+        if d <= 30:
+            return "0–30d"
+        elif d <= 90:
+            return "30–90d"
+        elif d <= 365:
+            return "3m–1y"
+        else:
+            return ">1y"
+
+    term["bucket"] = term["dte"].apply(bucket_dte)
+
+    # --- Main line (overall curve) + colored points by bucket ---
+    fig_t = px.scatter(
         term,
         x="dte",
         y="atm_iv",
-        markers=True,
+        color="bucket",
         template=PX_TEMPLATE,
+        labels={"dte": "Days to Expiration", "atm_iv": "ATM IV", "bucket": "Maturity"},
         title="ATM IV Across Expirations",
-        labels={"dte": "Days to Expiration", "atm_iv": "ATM IV"},
-        color_discrete_sequence=["#1E90FF"],
     )
 
-    fig_t.update_layout(hovermode="x unified")
-    st.plotly_chart(fig_t, use_container_width=True)
+    # Add a smooth connecting line over all expiries
+    fig_t.add_scatter(
+        x=term["dte"],
+        y=term["atm_iv"],
+        mode="lines",
+        name="ATM IV curve",
+        line=dict(width=2),
+        showlegend=True,
+    )
 
+    # Vertical reference lines (30 / 90 / 180 / 365 days) if in range
+    for ref in [30, 90, 180, 365]:
+        if ref <= max_dte:
+            fig_t.add_vline(
+                x=ref,
+                line_dash="dot",
+                line_width=1,
+                line_color="gray",
+                opacity=0.4,
+            )
+
+    fig_t.update_layout(
+        hovermode="x unified",
+        legend_title_text="Maturity",
+    )
+
+    st.plotly_chart(fig_t, use_container_width=True)
 
 # ---- Tab 5: Table ----
 with tabs[4]:
@@ -964,22 +1144,30 @@ with tabs[11]:
         st.stop()
 
     col1, col2 = st.columns([1, 1])
-    with col1:
-        max_n = len(all_dates)
-        n_rows = st.slider(
-            "Number of snapshots (most recent)",
-            min_value=5,
-            max_value=max_n,
-            value=min(25, max_n),
-            step=1,
-            key="summary_n",
-        )
-    with col2:
-        exp_mode = st.selectbox(
-            "Expiration mode",
-            ["All expirations", "Front expiration only"],
-            key="summary_exp_mode",
-        )
+
+with col1:
+    max_n = len(all_dates)
+
+    # Safe slider bounds
+    min_v = 1
+    max_v = max_n
+    default_v = min(25, max_v)
+
+    n_rows = st.slider(
+        "Number of snapshots (most recent)",
+        min_value=min_v,
+        max_value=max_v,
+        value=default_v,
+        step=1,
+        key="summary_n",
+    )
+
+with col2:
+    exp_mode = st.selectbox(
+        "Expiration mode",
+        ["All expirations", "Front expiration only"],
+        key="summary_exp_mode",
+    )
 
     scale_millions = st.checkbox(
         "Show values in millions",
