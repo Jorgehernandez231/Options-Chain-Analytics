@@ -908,36 +908,126 @@ with tabs[5]:
 # ---- Tab 7: OI Change (Flows) ----
 with tabs[6]:
     st.subheader("Open Interest Change (Day-over-Day)")
+
     all_dates = load_run_dates()
     if not all_dates:
-        st.info("History table not available."); st.stop()
+        st.info("History table not available.")
+        st.stop()
+
+    # Same logic as before for current / previous snapshot
     date_cur = chosen_date if (use_hist and chosen_date) else all_dates[0]
     date_prev = prev_run_date(all_dates, date_cur)
 
     cur, prv = load_chain_two_days(date_cur, date_prev)
     if cur.empty:
-        st.info("No rows for selected date."); st.stop()
+        st.info("No rows for selected date.")
+        st.stop()
 
-    exp_sel = st.selectbox("Expiration", sorted(cur["expiration_date"].unique()), key="exp_oi_change")
-    key_cols = ["expiration_date","strike","cp"]
+    exp_sel = st.selectbox(
+        "Expiration",
+        sorted(cur["expiration_date"].unique()),
+        key="exp_oi_change"
+    )
+    key_cols = ["expiration_date", "strike", "cp"]
 
-    cur_e = cur[cur["expiration_date"].eq(exp_sel)][key_cols + ["oi","volume","iv"]].rename(columns={"oi":"oi_cur","volume":"vol_cur","iv":"iv_cur"})
-    prv_e = prv[prv["expiration_date"].eq(exp_sel)][key_cols + ["oi"]].rename(columns={"oi":"oi_prev"})
+    cur_e = (
+        cur[cur["expiration_date"].eq(exp_sel)][key_cols + ["oi", "volume", "iv"]]
+        .rename(columns={"oi": "oi_cur", "volume": "vol_cur", "iv": "iv_cur"})
+    )
+    prv_e = (
+        prv[prv["expiration_date"].eq(exp_sel)][key_cols + ["oi"]]
+        .rename(columns={"oi": "oi_prev"})
+    )
 
     merged = pd.merge(cur_e, prv_e, on=key_cols, how="left")
-    for c in ["oi_prev","oi_cur","vol_cur","iv_cur"]: merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
+    for c in ["oi_prev", "oi_cur", "vol_cur", "iv_cur"]:
+        merged[c] = pd.to_numeric(merged[c], errors="coerce").fillna(0)
+
     merged["oi_change"] = merged["oi_cur"] - merged["oi_prev"]
 
-    hm = merged.groupby(["strike","cp"], as_index=False)["oi_change"].sum()
-    fig_hm = px.bar(hm, x="strike", y="oi_change", color="cp", barmode="group",
-                    template=PX_TEMPLATE, title=f"OI Change by Strike — {date_prev or '?'} → {date_cur}", color_discrete_sequence=["#1E90FF", "#FF4500"])
+    # ---- Zoom & clipping controls ----
+    colz1, colz2 = st.columns(2)
+    with colz1:
+        zoom_pct = st.slider(
+            "Zoom around Spot (±%)",
+            min_value=0,
+            max_value=60,
+            value=20,
+            step=5,
+            help="If >0, only show strikes within ±% of Spot.",
+            key="oi_change_zoom_pct",
+        )
+    with colz2:
+        cap_pct = st.slider(
+            "Cap extreme OI spikes (percentile)",
+            min_value=90,
+            max_value=100,
+            value=99,
+            step=1,
+            help="Clips huge OI changes so normal moves become visible.",
+            key="oi_change_cap_pct",
+        )
+
+    hm = merged.groupby(["strike", "cp"], as_index=False)["oi_change"].sum()
+
+    df_plot = hm.copy()
+
+    # X-axis zoom around spot
+    if zoom_pct > 0 and np.isfinite(float(spot)):
+        lo = float(spot) * (1 - zoom_pct / 100.0)
+        hi = float(spot) * (1 + zoom_pct / 100.0)
+        df_plot = df_plot[(df_plot["strike"] >= lo) & (df_plot["strike"] <= hi)]
+
+    # Percentile cap on absolute OI change
+    if cap_pct < 100 and not df_plot["oi_change"].dropna().empty:
+        lim = float(np.nanpercentile(np.abs(df_plot["oi_change"]), cap_pct))
+        df_plot["oi_change"] = df_plot["oi_change"].clip(-lim, lim)
+
+    # Pretty timestamps for title
+    def fmt_dt(dt):
+        return dt.strftime("%Y-%m-%d %H:%M:%S") if dt is not None else "?"
+
+    title = f"OI Change by Strike — {fmt_dt(date_prev)} → {fmt_dt(date_cur)}"
+
+    fig_hm = px.bar(
+        df_plot,
+        x="strike",
+        y="oi_change",
+        color="cp",
+        barmode="group",
+        template=PX_TEMPLATE,
+        title=title,
+        color_discrete_sequence=[
+            "rgba(30,144,255,0.6)",   # lighter blue
+            "rgba(255,69,0,0.6)",     # lighter orange/red
+        ],
+    )
     fig_hm.update_layout(hovermode="x unified")
     fig_hm = add_spot_line(fig_hm, spot)
     st.plotly_chart(fig_hm, use_container_width=True)
 
+    # Top movers table (unchanged)
     topN = st.slider("Show top N absolute movers", 10, 200, 50, 5)
-    movers = merged.reindex(merged["oi_change"].abs().sort_values(ascending=False).index).head(topN)
-    st.dataframe(movers[["expiration_date","cp","strike","oi_prev","oi_cur","oi_change","vol_cur","iv_cur"]], use_container_width=True, height=380)
+    movers = merged.reindex(
+        merged["oi_change"].abs().sort_values(ascending=False).index
+    ).head(topN)
+    st.dataframe(
+        movers[
+            [
+                "expiration_date",
+                "cp",
+                "strike",
+                "oi_prev",
+                "oi_cur",
+                "oi_change",
+                "vol_cur",
+                "iv_cur",
+            ]
+        ],
+        use_container_width=True,
+        height=380,
+    )
+
 
 # ---- Tab 8: Positioning Tilt ----
 with tabs[7]:
