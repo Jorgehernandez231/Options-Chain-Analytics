@@ -163,6 +163,12 @@ def nearest_strike_iv(df, exp, spot):
     ivp = dfe[(dfe["strike"]==k)&(dfe["cp"]=="P")]["iv"].dropna().mean()
     return np.nanmean([ivc, ivp])
 
+# ---------- Helpers ----------
+def tab_help(md_text: str):
+    """Standard inline help expander for each tab."""
+    with st.expander("What am I seeing?", expanded=False):
+        st.markdown(md_text)
+
 # ---------- Load initial data ----------
 dates = load_run_dates()
 
@@ -313,13 +319,40 @@ tabs = st.tabs([
     "IV Skew", "OI & Volume", "Gamma (approx)", "Term Structure", "Table",
     "Skew Overlay (Multi-Expiry)", "OI Change (Flows)", "Positioning Tilt",
     "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface",
-    "Summary"
+    "Summary", "Help & How To Use"
 ])
+
 
 
 # ---- Tab 1: IV Skew ----
 with tabs[0]:
     st.subheader("Volatility Skew")
+    tab_help("""
+**What this shows**
+
+This view plots the **implied volatility (IV)** of options for a single expiration against either **strike** or **moneyness (K/S)**.  
+You can see **Calls vs Puts**, optional **smoothed lines** (LOWESS), and a **mid IV** line (average of C and P at each x).
+
+- When IV **increases as strike decreases** (for puts) → classic **equity skew / smirk** (downside protection is expensive).  
+- When wings (far OTM) are very high vs ATM → **fat tails priced into the distribution**.  
+- Flat skew → market prices a more “normal” distribution, with less fear in the tails.
+
+**How to read it**
+
+- **Spot line** (or K/S = 1 in moneyness):  
+  - ATM region — where most delta sits and where hedging flows tend to concentrate.  
+- **Calls vs Puts:**  
+  - Asymmetry between call and put IV can hint at **call overwriting**, upside panic, or put buying.  
+- **Smoothed curves:**  
+  - Use them to see the **overall shape** without being distracted by noisy individual quotes.
+
+**Typical questions to answer here**
+
+- Are **downside puts** very expensive vs ATM? (Crash protection bid.)  
+- Are **OTM calls** (e.g., K/S > 1.05–1.10) unusually rich? (Chase for upside convexity.)  
+- Did the **shape of the skew** change after an event (earnings, macro, etc.)?
+""")
+
 
     # ── Controls ─────────────────────────────────────────────────────────────
     col_sk1, col_sk2, col_sk3 = st.columns([1, 1, 1])
@@ -460,6 +493,37 @@ with tabs[0]:
 # ---- Tab 2: OI & Volume ----
 with tabs[1]:
     st.subheader("Open Interest & Volume")
+    tab_help("""
+**What this shows**
+
+Two bar charts by **strike and side (C / P)**:
+
+1. **Open Interest (OI)** → how many contracts are currently open.  
+2. **Volume** → how many contracts traded in the current snapshot.
+
+Together they show **where positions are sitting** and **where trading is active today**.
+
+**How to read it**
+
+- **High OI, low volume:**  
+  - Large “parked” positions, not much trading today. Can still matter for gamma/GEX and pinning.  
+- **High OI, high volume:**  
+  - Key battleground strikes where traders are actively adjusting big positions.  
+- **Low OI, high volume:**  
+  - Fresh activity, possible **new structures** forming.
+
+**Controls & interpretation**
+
+- **Log scale:**  
+  - Use when a few huge strikes compress the rest of the chart; log reveals **relative structure**.  
+- **Percentile clipping:**  
+  - Caps extreme bars so mid-sized strikes are still visible.  
+- **ATM zoom:**  
+  - Focus on the area where Spot is trading; relevant for short-term moves and gamma effects.
+
+Use this tab to quickly answer:  
+> “Where are people **positioned** and where is today’s **action**?”
+""")
 
     # ── Controls (local to this tab) ───────────────────────────────────────────
     colc1, colc2, colc3 = st.columns([1, 2, 2])
@@ -527,6 +591,38 @@ with tabs[1]:
 # ---- Tab 3: Gamma (approx) ----
 with tabs[2]:
     st.subheader("Dealer Gamma Exposure (approx)")
+    tab_help("""
+**What this shows**
+
+An approximation of **dealer gamma exposure (GEX)** across strikes:
+
+- Computes **option gamma** via a Black–Scholes-style formula.  
+- Multiplies by **Open Interest** and a contract multiplier to estimate a **notional gamma** per strike.  
+- Aggregates into **Call Γ**, **Put Γ**, **Total Γ**, plus a **cumulative curve**.
+
+The idea: this is a map of where dealers (in aggregate) are **long or short gamma**.
+
+**How to read it**
+
+- **Total Γ > 0 (long gamma region):**  
+  - Dealers tend to **buy dips and sell rips** (hedging dampens moves).  
+- **Total Γ < 0 (short gamma region):**  
+  - Hedging can **amplify moves** (buying high, selling low), making price more jumpy.  
+- **Cumulative Γ:**  
+  - Shows how gamma risk accumulates as you move across strikes — useful to see whether gamma is concentrated in one area or spread out.  
+- **Flip strike (yellow line):**  
+  - Approx strike where total gamma shifts sign → often watched as a **regime line**.  
+- **Spot line (cyan):**  
+  - Where the market currently trades relative to the gamma structure.
+
+**Practical use**
+
+- If **Spot is well inside a strong long gamma region**, expect **mean-reverting, slower moves**.  
+- If **Spot moves into/through a short gamma pocket**, moves can become **sharp and directional**.  
+- Combine this with the **OI & Volume** tab to see where large positions and gamma are aligned.
+""")
+
+
     CONTRACT_MULT = 100.0
     today = date.today()
 
@@ -688,6 +784,32 @@ with tabs[2]:
 # ---- Tab 4: Term Structure ----
 with tabs[3]:
     st.subheader("ATM IV Term Structure")
+    tab_help("""
+**What this shows**
+
+The **ATM implied volatility** for many expirations vs **days to expiration (DTE)**:
+
+- Each dot = one expiration’s ATM IV.  
+- Colors group expirations into maturity buckets (short, medium, long).  
+- A line connects them to show the overall **vol curve in time**.
+
+This is the **term structure of volatility**: how expensive options are by horizon.
+
+**How to read it**
+
+- **Upward sloping curve:**  
+  - Short-dated vol cheaper than long-dated. Typical in quiet periods or when long-term uncertainty is higher.  
+- **Inverted / hump-shaped:**  
+  - Short-dated vol elevated (event risk: CPI, FOMC, earnings), with medium/long-dated calmer.  
+- **Kinks / jumps:**  
+  - Specific expiries pricing in special events (Fed meeting, big macro date, index rebalances).
+
+**Practical questions**
+
+- Is **front vol** expensive vs the rest of the curve? (Event premium.)  
+- Are **long-dated options** unusually cheap or rich vs their historical norms?  
+- If you trade spreads across time (calendar/diagonal), this view helps identify **which leg is “rich” vs “cheap”** in volatility terms.
+""")
 
     today = date.today()
 
@@ -791,12 +913,54 @@ with tabs[3]:
 # ---- Tab 5: Table ----
 with tabs[4]:
     st.subheader("Contracts")
+    tab_help("""
+**What this shows**
+
+A **raw table** of the options that feed the charts for the current filters:
+
+- Columns include side (`cp`), strike, prices (`bid`, `ask`, `last`), IV, volume and OI.  
+- Each row represents **one contract** at a specific strike, side and expiration.
+
+**How to use it**
+
+- To **inspect a specific strike**, check if the prices and IV look reasonable.  
+- To verify **odd points** you see in skew or gamma (e.g., a spike), come here and see if it’s:  
+  - A real quote (big volume/OI).  
+  - Or a bad/missing print (zero / NaNs / stale price).  
+- Use sorting/filtering (via the UI) to focus on:  
+  - Highest volume, highest IV, weird bid/ask spreads, etc.
+
+This tab is your **X-ray** for the rest of the dashboard.
+""")
+
+
     cols = ["expiration_date","cp","strike","bid","ask","last","iv","volume","oi"]
     st.dataframe(dfe[cols].sort_values(["cp","strike"]), use_container_width=True, height=420)
 
 # ---- Tab 6: Skew Overlay (Multi-Expiry) ----
 with tabs[5]:
     st.subheader("Multi-Expiry Skew Overlay (IV vs Strike or Moneyness)")
+    tab_help("""
+**What this shows**
+
+IV skews for **multiple expirations** plotted on the same axes:
+
+- Each line = skew for one expiration (possibly averaged across Calls/Puts).  
+- You can choose **Strike** or **Moneyness (K/S)** as the x-axis.  
+- Smoothing removes noise and lets you see the **shape by tenor**.
+
+**How to read it**
+
+- Compare **front vs back**:  
+  - Front-month skew usually responds strongest to near-term risk.  
+  - Back-month skew reflects more structural or long-term risk pricing.  
+- If **short-dated puts** are much steeper (higher downside IV) than long-dated:  
+  - Market expects intense short-term risk but calmer long run.  
+- If **long-dated wings** are high:  
+  - Tail risk is being priced far out (e.g., structural macro worry).
+
+This tab is great for spotting **which expiries are “doing something different”** in skew compared to the rest.
+""")
 
     exps_all = sorted(df["expiration_date"].unique())
 
@@ -908,6 +1072,35 @@ with tabs[5]:
 # ---- Tab 7: OI Change (Flows) ----
 with tabs[6]:
     st.subheader("Open Interest Change (Day-over-Day)")
+    tab_help("""
+**What this shows**
+
+The **change in Open Interest** by strike and side between two snapshots (today vs previous run):
+
+- For each strike & side (Call/Put):  
+  `OI_change = OI_today − OI_previous`.  
+- Bars show how many contracts were **added or removed** at each level.  
+- A table below lists the **largest absolute movers** with extra context (volume, IV).
+
+**How to read it**
+
+- **Big positive bar:**  
+  - New positions opened → fresh interest there (could be hedging, speculation, or spread legs).  
+- **Big negative bar:**  
+  - Large positions closed/rolled or exercised/expired.  
+- Clusters of changes near certain strikes can indicate **rolls** (e.g., 5000 → 5100).
+
+**Using the controls**
+
+- **Zoom around Spot:**  
+  - Focus on changes near the current price.  
+- **Percentile cap:**  
+  - Avoid one huge change masking smaller but important flows.  
+- **Top N movers:**  
+  - Jump straight to the most important strikes by flow.
+
+Think of this as your **flow radar**: “Where did the book meaningfully change since last time?”
+""")
 
     all_dates = load_run_dates()
     if not all_dates:
@@ -1032,6 +1225,29 @@ with tabs[6]:
 # ---- Tab 8: Positioning Tilt ----
 with tabs[7]:
     st.subheader("Net Positioning Tilt (Call OI − Put OI)")
+    tab_help("""
+**What this shows**
+
+A **net balance** of open interest between calls and puts at each strike:
+
+- For each strike: `Tilt = Call OI − Put OI`.  
+- Bars above zero → **call-heavy**; below zero → **put-heavy**.  
+- A zero line makes the neutral level obvious; the Spot line shows current price.
+
+**How to read it**
+
+- **Call-heavy regions:**  
+  - Often associated with **covered call writing** or speculative upside structures.  
+- **Put-heavy regions:**  
+  - Can signal **downside hedging**, protective puts, or structured short exposure.  
+- Look at where **Spot sits** relative to big tilts:  
+  - If Spot is just below a **call-heavy region**, that may act as resistance (supply of calls).  
+  - If Spot is above a put-heavy area, that region may reflect hedging / protection below.
+
+Use this tab for a quick visual answer to:  
+> “At each strike, is the crowd skewed more towards **upside or downside** exposure?”
+""")
+
     cur_all = df.copy()
     exp_tilt = st.selectbox("Expiration", sorted(cur_all["expiration_date"].unique()), key="tilt_exp")
     cur_e = cur_all[cur_all["expiration_date"].eq(exp_tilt)]
@@ -1052,6 +1268,32 @@ with tabs[7]:
 # ---- Tab 9: Spread Detector ----
 with tabs[8]:
     st.subheader("Spread Detector (heuristic)")
+    tab_help("""
+**What this shows**
+
+A **rule-based detector** that looks at OI changes and tries to spot:
+
+- **Vertical spread candidates:**  
+  - Same side (all Calls or all Puts).  
+  - Adjacent strikes with **similar absolute OI change**.  
+- **Iron condor candidates:**  
+  - One call vertical + one put vertical where the average |OI change| is similar.
+
+It’s not perfect, but it highlights **patterns of OI change** that *look like* spreads.
+
+**How to read it**
+
+- **Vertical spreads table:**  
+  - Shows pairs of strikes and the size of OI change in each leg.  
+  - You can infer whether it’s likely a **bull** or **bear** spread based on strikes and context.  
+- **Iron condors table:**  
+  - Groups four strikes into a potential condor structure.  
+  - Large `avg_abs_oi_change` hint at size.
+
+Use this as a **starting point**:  
+- Identify interesting candidates here, then inspect them more closely in the **OI Change** and **Contracts** tabs to understand intent and pricing.
+""")
+
     all_dates = load_run_dates()
     if not all_dates:
         st.info("History table not available."); st.stop()
@@ -1122,6 +1364,29 @@ with tabs[8]:
 # ---- Tab 10: Skew Today vs Yesterday ----
 with tabs[9]:
     st.subheader("Skew Overlay: Today vs Yesterday")
+    tab_help("""
+**What this shows**
+
+IV skew for a single expiration on **two different dates** (typically consecutive runs):
+
+- Two curves: **current run vs previous run**.  
+- X-axis is strike or moneyness; y-axis is IV.  
+- You can either **average C/P** or keep them separate, and optionally smooth.
+
+**How to read it**
+
+- Compare **levels**:  
+  - If the whole skew shifted up/down, vol repriced across the board.  
+- Compare **shape**:  
+  - If downside IV rose more than upside, protection demand increased.  
+  - If upside IV popped, there may be chase for upside convexity.  
+- It’s especially useful around **events**:  
+  - Before vs after CPI/FOMC/earnings to see how the market repriced risk.
+
+This tab answers:  
+> “**What changed in skew** between yesterday and today for this expiration?”
+""")
+
     all_dates = load_run_dates()
     if not all_dates or len(all_dates) < 2:
         st.info("Need at least two run dates in history to compare."); st.stop()
@@ -1201,6 +1466,31 @@ with tabs[9]:
 # ---- Tab 11: 3D Vol Surface ----
 with tabs[10]:
     st.subheader("3D Volatility Surface (Moneyness × DTE × IV)")
+    tab_help("""
+**What this shows**
+
+A **3D surface** of implied volatility across:
+
+- **Moneyness (K/S):** how far strike is from Spot.  
+- **Days to Expiration (DTE):** short-dated to long-dated.  
+- **IV:** represented by height and color.
+
+This is essentially your **vol surface snapshot**.
+
+**How to read it**
+
+- Look for **ridges and valleys**:  
+  - Ridges = areas where options are especially expensive (high IV).  
+  - Valleys = relatively cheap regions.  
+- Observe how **smile/smirk** changes with time:  
+  - Near-term may have a strong downside skew; further out may be flatter.  
+- Event-related bumps:  
+  - Single DTE regions standing out (like a “vol mountain”) may correspond to event dates.
+
+Use this for an overall **gestalt**:  
+> “Where, in (strike, time), is vol rich or cheap right now?”
+""")
+
     surf = df.copy()
     if surf.empty:
         st.info("No data to render."); st.stop()
@@ -1227,6 +1517,27 @@ with tabs[10]:
 # ---- Tab 12: Summary (Volume, OI, Gamma, GEX) ----
 with tabs[11]:
     st.subheader("Daily Summary by Expiration (Volume, OI, Gamma, GEX)")
+    tab_help("""
+**What this shows**
+
+A **time-series style summary** of key metrics by snapshot and expiration:
+
+- **Volume (Call/Put):** how actively each expiry traded.  
+- **OI (Call/Put) & Delta OI:** how positioning size and balance evolve.  
+- **Gamma & Net GEX:** aggregate gamma exposure by expiry.  
+- **Contracts / ATM close proxy:** rough sense of size and underlying level.
+
+Each row is: **one run timestamp × one expiration**.
+
+**How to read it**
+
+- Track **which expirations** are gaining or losing OI and gamma.  
+- See whether **Net GEX** is becoming more positive/negative for front vs back expiries.  
+- Spot **regime shifts**: e.g., front month flipping from long to short gamma across days, or big jumps in put OI before events.
+
+Use this tab as your **dashboard of dashboards**:  
+> it tells you how the overall options landscape is **drifting over time**, not just in a single snapshot.
+""")
 
     all_dates = load_run_dates()
     if not all_dates:
@@ -1392,3 +1703,145 @@ with col2:
 
     st.dataframe(summary_df, use_container_width=True, height=540)
 
+# ---- Tab 13: Help & How To Use ----
+with tabs[12]:
+    st.subheader("How to Use SPX Terminal")
+
+    st.markdown("""
+This dashboard is designed to explore **SPX options positioning, volatility and flows**.
+
+---
+
+### 1️⃣ Global Controls (top & sidebar)
+
+**Sidebar – History**
+- **Use history**: when checked, you select a specific snapshot from the database instead of the latest one.
+- **Run timestamp (UTC)**: pick which run (download) of the options chain you want to analyze.
+
+**Top controls**
+- **Spot (S)**: approximate underlying level. Used for moneyness (K/S), ATM zooms, gamma, GEX, etc.
+- **Risk-free (r)**: risk-free rate used in Black–Scholes–based gamma calculations.
+- **Calls / Puts toggles**: choose which side is visible across most charts.
+- **Expiration**: base expiration used in many tabs for single-expiry views.
+- **Strike range slider**: global strike filter for the selected expiration.
+
+**Sidebar – Permalink**
+- **Update URL with current filters**: writes the current settings into the URL so you can bookmark or share the exact view.
+
+---
+
+### 2️⃣ Tab-by-Tab Guide
+
+**IV Skew**
+- Shows **implied volatility vs strike or moneyness (K/S)** for the selected expiration.
+- Use:
+  - **X-axis**: switch between Strike or Moneyness.
+  - **Show smoothed curve**: LOWESS smoothing for cleaner skew lines.
+  - **ATM zoom (±%)**: focus on strikes around Spot.
+- The **vertical dotted line** is the Spot (or K/S = 1 if in moneyness).
+
+**OI & Volume**
+- Bar charts of **Open Interest** and **Volume** by strike.
+- Useful for spotting where **positioning and traded activity** are concentrated.
+- Controls:
+  - **Log scale (Y)**: helps when a few strikes are very large.
+  - **Clip at percentile**: caps extreme spikes so the rest is visible.
+  - **ATM zoom (±%)**: focus around Spot.
+
+**Gamma (approx)**
+- Estimates **dealer gamma exposure (GEX)** by strike using Black–Scholes gamma.
+- Bars:
+  - Γ Call, Γ Put, and **Total Γ** (sum).
+- Orange line:
+  - **Cumulative Γ**, which can highlight the **flip strike** where net gamma changes sign.
+- The yellow dashed line marks the **approximate flip level**; cyan dotted line is Spot.
+
+**Term Structure**
+- **ATM IV vs Days to Expiration** for all expiries.
+- Lets you see if the vol curve is **steep, flat, or inverted**.
+- Controls:
+  - **Max days to expiration**: limit to short-dated, medium, or long-dated expiries.
+  - **Clip extreme IV outliers**: removes bad quotes that distort the curve.
+- Reference vertical lines (30/90/180/365 days) help identify maturity buckets.
+
+**Table**
+- Raw table of contracts for the selected expiration & filters:
+  - `expiration_date, cp, strike, bid, ask, last, iv, volume, oi`.
+- Good for **sanity checks** and manual inspection.
+
+**Skew Overlay (Multi-Expiry)**
+- Compare **IV skews across multiple expirations**.
+- Controls:
+  - **Select expirations to overlay**: choose which exps to compare (default: highest volume ones).
+  - **X-axis**: Strike vs Moneyness.
+  - **Average Calls & Puts together**: on = one line per expiry; off = separate C/P lines.
+  - **Smoothing**: raw marks or LOWESS-smoothed curves.
+- Use this tab to see **term structure of skew** (e.g. front vs back vol behavior).
+
+**OI Change (Flows)**
+- Day-over-day **change in open interest** by strike for one expiration.
+- Bars show **newly opened or closed positions**:
+  - Positive = OI increased; Negative = OI decreased.
+- Controls:
+  - **Zoom around Spot (±%)**: focus where the action is.
+  - **Cap extreme OI spikes**: make normal-sized flows visible.
+  - **Top N absolute movers** table lists the largest OI changes with volume and IV.
+
+**Positioning Tilt**
+- Net **Call OI − Put OI** by strike for a chosen expiration.
+- Above zero: **call-heavy**; below zero: **put-heavy**.
+- Useful for quickly seeing **where the market is tilted**.
+
+**Spread Detector**
+- Heuristic detector of:
+  - **Vertical spreads** (same side, adjacent strikes, similar OI change).
+  - **Iron condors** (pair of verticals, calls + puts).
+- Output:
+  - **Vertical Spread candidates** (strike pairs).
+  - **Iron Condor candidates** (4 legs).
+- Treat this as a **lead-generation tool**, not strict classification.
+
+**Skew: Today vs Yesterday**
+- Overlay IV skews **today vs previous run** for the same expiration.
+- Shows how skew **shifted or twisted** over time.
+- Controls:
+  - **X-axis**: Strike vs Moneyness.
+  - **Average Calls & Puts together** or split by C/P.
+  - Optional **LOWESS smoothing**.
+
+**3D Vol Surface**
+- 3D surface of **IV over Moneyness × Days to Expiration**.
+- Helps visualize where vol is **rich or cheap across strikes and maturities**.
+
+**Summary**
+- Historical **daily summary by expiration**:
+  - Volumes, OI, Delta OI, Call/Put gamma, Net GEX, contracts, approximate close.
+- Controls:
+  - **Number of snapshots (most recent)**: how many days to include.
+  - **Expiration mode**: aggregate all expiries or only the front one.
+  - **Show values in millions**: better readability for large numbers.
+- Use this to follow **drifts in positioning and gamma over time**.
+
+---
+
+### 3️⃣ Recommended Workflow
+
+1. **Start in Term Structure + IV Skew**  
+   Understand the **overall vol level & shape** for a given expiry.
+
+2. **Look at OI & Volume + Positioning Tilt**  
+   See where traders are concentrated and whether they are more **call- or put-heavy**.
+
+3. **Check Gamma (approx) & Summary**  
+   Identify **gamma flip zones** and the overall **GEX regime** (support / resistance zones).
+
+4. **Use OI Change (Flows) & Spread Detector**  
+   See **where fresh positioning is happening** and which **spreads / structures** might be active.
+
+5. **Use Skew Today vs Yesterday**  
+   Track **how the skew moves** around events (CPI/FOMC, earnings, etc.).
+
+If you hover around long enough, the charts will talk to you. 😄
+""")
+    st.markdown("---")
+    st.markdown("© 2024 SPX Terminal. Built with ❤️ using Streamlit.")  
