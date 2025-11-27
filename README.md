@@ -126,7 +126,7 @@ Runs the ETL pipeline on a schedule to keep the database updated.
 
 ## 📂 Project Structure
 
-.
+`.
 ├── dashboard.py
 ├── spx_to_neon_final.py
 ├── requirements.txt
@@ -135,7 +135,7 @@ Runs the ETL pipeline on a schedule to keep the database updated.
 ├── .github
 │ └── workflows
 │ └── daily_spx.yml
-└── README.md
+└── README.md`
 
 ---
 
@@ -181,9 +181,6 @@ python spx_to_neon_final.py
 
 streamlit run dashboard.py
 
-Open browser at:
-
-http://localhost:8501
 
 ---
 
