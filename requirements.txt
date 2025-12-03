@@ -7,3 +7,4 @@ requests
 statsmodels==0.14.2
 scipy>=1.10
 statsmodels
+sqlalchemy
