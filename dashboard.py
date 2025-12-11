@@ -169,19 +169,18 @@ def tab_help(md_text: str):
     with st.expander("What am I seeing?", expanded=False):
         st.markdown(md_text)
         
-def get_atm_iv_for_expiry(df, exp_sel, moneyness_band=0.03):
+def get_atm_iv_for_expiry(df, exp_sel, spot, moneyness_band=0.03):
     """
-    df: chain for one run date
-    exp_sel: selected expiration_date (same type as df['expiration_date'])
+    df: chain for one run date (global df already loaded)
+    exp_sel: selected expiration_date
+    spot: current underlying price used in the app (float)
     Returns: (underlying_price, atm_iv) or (underlying_price, None)
     """
     dfe = df[df["expiration_date"].eq(exp_sel)].copy()
     if dfe.empty:
-        return None, None
+        return float(spot), None
 
-    # assume underlying is same for all rows that day
-    u = float(dfe["underlying_px"].iloc[0])
-
+    u = float(spot)
     dfe["moneyness"] = dfe["strike"] / u
     dfe = dfe[dfe["moneyness"].between(1 - moneyness_band, 1 + moneyness_band)]
 
@@ -215,14 +214,20 @@ def compute_probable_ranges(underlying, atm_iv, days_to_exp):
     }
     return ranges
 
-def top_gravity_levels(df, exp_sel, low, high, top_n=5):
+def top_gravity_levels(df, exp_sel, low, high, spot, top_n=5):
+    """
+    Find strikes inside [low, high] with the strongest positioning
+    (by gamma*OI if gamma exists, otherwise by OI).
+    """
     dfe = df[df["expiration_date"].eq(exp_sel)].copy()
-    u = float(dfe["underlying_px"].iloc[0])
-
     dfe = dfe[dfe["strike"].between(low, high)]
 
-    # simple “gravity”: OI or gamma * OI
-    if "gamma" in dfe.columns:
+    if dfe.empty:
+        return pd.DataFrame(columns=["strike", "position_metric"])
+
+    # If gamma exists, use gamma_notional; otherwise fall back to OI
+    if "gamma" in dfe.columns and dfe["gamma"].notna().any():
+        u = float(spot)
         dfe["gamma_notional"] = dfe["gamma"] * dfe["oi"] * 100 * (u * u)
         metric_col = "gamma_notional"
     else:
@@ -235,6 +240,7 @@ def top_gravity_levels(df, exp_sel, low, high, top_n=5):
         .sort_values(metric_col, ascending=False)
         .head(top_n)
     )
+    out = out.rename(columns={metric_col: "position_metric"})
     return out
 
 # ---------- Load initial data ----------
@@ -390,7 +396,94 @@ tabs = st.tabs([
     "Summary", "Help & How To Use", "Probable Levels"
 ])
 
+PROB_IDX = tabs.index("Probable Levels")
 
+with tabs[PROB_IDX]:
+    st.subheader("Probable Levels (Expected Move from Options)")
+
+    # 1) Pricing date (today vs history)
+    if use_hist and (chosen_date is not None):
+        d0 = chosen_date.date()
+    else:
+        d0 = date.today()
+
+    # 2) Choose expiration to analyze
+    #    Use the same expiries list you already created at the top controls.
+    exp_default_idx = expiries.index(exp) if exp in expiries else 0
+    exp_sel = st.selectbox(
+        "Expiration for expected move",
+        expiries,
+        index=exp_default_idx,
+        key="prob_exp",
+    )
+
+    # 3) Days to expiry
+    days_to_exp = max((exp_sel - d0).days, 1)
+
+    # 4) ATM IV estimation around the current spot
+    _, atm_iv = get_atm_iv_for_expiry(df, exp_sel, spot)
+
+    if (atm_iv is None) or np.isnan(atm_iv) or (atm_iv <= 0):
+        st.info("Could not estimate ATM IV for this expiration (no near-the-money quotes).")
+        st.stop()
+
+    # 5) Compute 1σ and 2σ price ranges
+    ranges = compute_probable_ranges(spot, atm_iv, days_to_exp)
+    if ranges is None:
+        st.info("Insufficient data to compute probable levels.")
+        st.stop()
+
+    # 6) Headline metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Current SPX (S₀)", f"{ranges['S0']:,.1f}")
+    with col2:
+        st.metric("ATM IV", f"{ranges['atm_iv']:.2%}")
+    with col3:
+        st.metric("Days to Expiry", f"{days_to_exp} d")
+
+    st.markdown("### 1σ range (≈68% under normal assumption)")
+    col4, col5 = st.columns(2)
+    with col4:
+        st.metric("1σ Low", f"{ranges['one_sigma_low']:,.1f}")
+    with col5:
+        st.metric("1σ High", f"{ranges['one_sigma_high']:,.1f}")
+
+    st.markdown("### 2σ range (≈95% under normal assumption)")
+    col6, col7 = st.columns(2)
+    with col6:
+        st.metric("2σ Low", f"{ranges['two_sigma_low']:,.1f}")
+    with col7:
+        st.metric("2σ High", f"{ranges['two_sigma_high']:,.1f}")
+
+    # 7) Strikes with strongest positioning inside the 1σ band
+    st.markdown("### Strikes with strongest positioning inside 1σ band")
+    gravity = top_gravity_levels(
+        df,
+        exp_sel,
+        ranges["one_sigma_low"],
+        ranges["one_sigma_high"],
+        spot,
+        top_n=5,
+    )
+
+    if gravity.empty:
+        st.caption("No strikes in range or no OI/gamma data available.")
+    else:
+        st.dataframe(gravity)
+
+    # 8) Visual sketch of the distribution (normal approximation around spot)
+    st.markdown("### Price distribution sketch (normal approximation)")
+    sd_price = ranges["S0"] * ranges["atm_iv"] * np.sqrt(ranges["T_years"])
+    price_grid = np.linspace(ranges["two_sigma_low"], ranges["two_sigma_high"], 200)
+    pdf = np.exp(-0.5 * ((price_grid - ranges["S0"]) / sd_price) ** 2)
+    pdf_df = pd.DataFrame({
+        "price": price_grid,
+        "density": pdf / pdf.max()
+    }).set_index("price")
+
+    st.line_chart(pdf_df)
+    st.caption("Illustrative only: assumes a normal distribution on price using ATM IV.")
 
 # ---- Tab 1: IV Skew ----
 with tabs[0]:
