@@ -21,6 +21,7 @@ HEADERS = {
 SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
     run_ts TIMESTAMPTZ NOT NULL,
+    underlying_px NUMERIC,
     expiration_date DATE,
     strike NUMERIC,
     cp TEXT,
@@ -101,6 +102,19 @@ def main():
     options = data.get("data", {}).get("options", [])
     if not options:
         raise Exception("No options returned.")
+
+    
+    # Adjust this line if your actual key is different.
+    data_block = data.get("data", {})
+    underlying_px = to_float(
+        data_block.get("underlying_price")
+        or data_block.get("underlying_last")
+        or data_block.get("underlying")
+        or data_block.get("last")  # fallback if structure changes
+    )
+
+    if underlying_px is None:
+        print("⚠️ Could not detect underlying_px from JSON; will stay NULL in this run.")
 
     rows = []
     now = datetime.now(timezone.utc)

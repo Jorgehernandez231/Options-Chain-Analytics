@@ -126,7 +126,17 @@ def prev_run_date(dates, cur_dt):
 @st.cache_data(ttl=180, show_spinner=False)
 def load_chain_by_run(run_ts):
     return q(f"""
-        SELECT run_ts, expiration_date, strike, cp, last, bid, ask, volume, oi, iv
+        SELECT run_ts,
+               underlying_px,
+               expiration_date,
+               strike,
+               cp,
+               last,
+               bid,
+               ask,
+               volume,
+               oi,
+               iv
         FROM {TABLE_HIST}
         WHERE run_ts = %s
         ORDER BY expiration_date, strike, cp
@@ -280,7 +290,20 @@ with st.sidebar:
 
 @st.cache_data(ttl=120, show_spinner=False)
 def load_latest():
-    return q(f"SELECT run_ts, expiration_date, strike, cp, last, bid, ask, volume, oi, iv FROM {TABLE_LATEST}")
+    return q(f"""
+        SELECT run_ts,
+               underlying_px,
+               expiration_date,
+               strike,
+               cp,
+               last,
+               bid,
+               ask,
+               volume,
+               oi,
+               iv
+        FROM {TABLE_LATEST}
+    """)
 
 
 df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
@@ -290,8 +313,9 @@ if df.empty:
 
 # Dtypes
 df["expiration_date"] = pd.to_datetime(df["expiration_date"]).dt.date
-for c in ["strike","last","bid","ask","iv","volume","oi"]:
-    if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
+for c in ["strike","last","bid","ask","iv","volume","oi","underlying_px"]:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
 
 # ---- Better SPOT detection from the options chain (ATM strike proxy) ----
 
@@ -1684,14 +1708,19 @@ with col2:
             if df_e.empty:
                 continue
 
-            # Approximate underlying close using ATM strike (highest volume)
-            if df_e["volume"].notna().any():
+            # ---- Spot detection: use underlying_px from database ----
+
+            if "underlying_px" in df.columns and df["underlying_px"].notna().any():
                 try:
-                    atm_k = float(df_e.loc[df_e["volume"].idxmax(), "strike"])
+                    default_spot = float(df["underlying_px"].dropna().iloc[0])
                 except Exception:
-                    atm_k = float(df_e["strike"].median(skipna=True))
+                    default_spot = float(df["strike"].median(skipna=True))
             else:
-                atm_k = float(df_e["strike"].median(skipna=True))
+                # fallback (rare) – use ATM strike proxy
+                if df["volume"].notna().any():
+                    default_spot = float(df.loc[df["volume"].idxmax(), "strike"])
+                else:
+                    default_spot = float(df["strike"].median(skipna=True))
 
             # Volume & OI
             vol_call = df_e.loc[df_e["cp"].eq("C"), "volume"].sum()
