@@ -282,8 +282,6 @@ with st.sidebar:
 def load_latest():
     return q(f"SELECT run_ts, expiration_date, strike, cp, last, bid, ask, volume, oi, iv FROM {TABLE_LATEST}")
 
-df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
-
 
 df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
 if df.empty:
@@ -396,94 +394,6 @@ tabs = st.tabs([
     "Summary", "Help & How To Use", "Probable Levels"
 ])
 
-PROB_IDX = tabs.index("Probable Levels")
-
-with tabs[PROB_IDX]:
-    st.subheader("Probable Levels (Expected Move from Options)")
-
-    # 1) Pricing date (today vs history)
-    if use_hist and (chosen_date is not None):
-        d0 = chosen_date.date()
-    else:
-        d0 = date.today()
-
-    # 2) Choose expiration to analyze
-    #    Use the same expiries list you already created at the top controls.
-    exp_default_idx = expiries.index(exp) if exp in expiries else 0
-    exp_sel = st.selectbox(
-        "Expiration for expected move",
-        expiries,
-        index=exp_default_idx,
-        key="prob_exp",
-    )
-
-    # 3) Days to expiry
-    days_to_exp = max((exp_sel - d0).days, 1)
-
-    # 4) ATM IV estimation around the current spot
-    _, atm_iv = get_atm_iv_for_expiry(df, exp_sel, spot)
-
-    if (atm_iv is None) or np.isnan(atm_iv) or (atm_iv <= 0):
-        st.info("Could not estimate ATM IV for this expiration (no near-the-money quotes).")
-        st.stop()
-
-    # 5) Compute 1σ and 2σ price ranges
-    ranges = compute_probable_ranges(spot, atm_iv, days_to_exp)
-    if ranges is None:
-        st.info("Insufficient data to compute probable levels.")
-        st.stop()
-
-    # 6) Headline metrics
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Current SPX (S₀)", f"{ranges['S0']:,.1f}")
-    with col2:
-        st.metric("ATM IV", f"{ranges['atm_iv']:.2%}")
-    with col3:
-        st.metric("Days to Expiry", f"{days_to_exp} d")
-
-    st.markdown("### 1σ range (≈68% under normal assumption)")
-    col4, col5 = st.columns(2)
-    with col4:
-        st.metric("1σ Low", f"{ranges['one_sigma_low']:,.1f}")
-    with col5:
-        st.metric("1σ High", f"{ranges['one_sigma_high']:,.1f}")
-
-    st.markdown("### 2σ range (≈95% under normal assumption)")
-    col6, col7 = st.columns(2)
-    with col6:
-        st.metric("2σ Low", f"{ranges['two_sigma_low']:,.1f}")
-    with col7:
-        st.metric("2σ High", f"{ranges['two_sigma_high']:,.1f}")
-
-    # 7) Strikes with strongest positioning inside the 1σ band
-    st.markdown("### Strikes with strongest positioning inside 1σ band")
-    gravity = top_gravity_levels(
-        df,
-        exp_sel,
-        ranges["one_sigma_low"],
-        ranges["one_sigma_high"],
-        spot,
-        top_n=5,
-    )
-
-    if gravity.empty:
-        st.caption("No strikes in range or no OI/gamma data available.")
-    else:
-        st.dataframe(gravity)
-
-    # 8) Visual sketch of the distribution (normal approximation around spot)
-    st.markdown("### Price distribution sketch (normal approximation)")
-    sd_price = ranges["S0"] * ranges["atm_iv"] * np.sqrt(ranges["T_years"])
-    price_grid = np.linspace(ranges["two_sigma_low"], ranges["two_sigma_high"], 200)
-    pdf = np.exp(-0.5 * ((price_grid - ranges["S0"]) / sd_price) ** 2)
-    pdf_df = pd.DataFrame({
-        "price": price_grid,
-        "density": pdf / pdf.max()
-    }).set_index("price")
-
-    st.line_chart(pdf_df)
-    st.caption("Illustrative only: assumes a normal distribution on price using ATM IV.")
 
 # ---- Tab 1: IV Skew ----
 with tabs[0]:
@@ -2008,54 +1918,47 @@ If you hover around long enough, the charts will talk to you. 😄
     st.markdown("© 2024 SPX Terminal. Built with ❤️ using Streamlit.")
 
 # ---- Tab 14: Probable Levels ---- 
-    
+
 with tabs[13]:  # "Probable Levels"
     st.subheader("Most Probable SPX Levels (from Options)")
 
-    all_dates = load_run_dates()
-    if not all_dates:
-        st.info("History table not available."); st.stop()
+    # 1) Pricing date (today vs chosen history snapshot)
+    if use_hist and (chosen_date is not None):
+        d0 = chosen_date.date()
+    else:
+        d0 = date.today()
 
-    # Same logic you use everywhere: use chosen_date if history mode, else latest
-    date_cur = chosen_date if (use_hist and chosen_date) else all_dates[0]
-
-    df = load_chain_for_date(date_cur)
-    if df.empty:
-        st.info("No rows for selected date."); st.stop()
-
-    # Pick expiration
+    # 2) Pick expiration (reuse the global expiries list)
     exps = sorted(df["expiration_date"].unique())
-    exp_sel = st.selectbox("Expiration", exps, key="prob_exp")
+    default_idx = exps.index(exp) if exp in exps else 0
+    exp_sel = st.selectbox(
+        "Expiration",
+        exps,
+        index=default_idx,
+        key="prob_exp",
+    )
 
-    # Parse dates to compute days_to_exp (adapt if your types differ)
-    # If they are already datetime.date, this just works:
-    try:
-        if isinstance(date_cur, str):
-            d0 = pd.to_datetime(date_cur).date()
-        else:
-            d0 = pd.to_datetime(date_cur).date()
+    # 3) Days to expiry
+    days_to_exp = max((exp_sel - d0).days, 1)
 
-        d_exp = pd.to_datetime(exp_sel).date()
-        days_to_exp = (d_exp - d0).days
-    except Exception:
-        # fallback: assume 30 days if parsing fails
-        days_to_exp = 30
-
-    underlying, atm_iv = get_atm_iv_for_expiry(df, exp_sel)
+    # 4) ATM IV estimation around current spot
+    underlying, atm_iv = get_atm_iv_for_expiry(df, exp_sel, spot)
 
     if underlying is None:
         st.info("Could not find data for this expiration.")
         st.stop()
 
-    if atm_iv is None:
-        st.info("Could not estimate ATM IV for this expiration (no near-the-money options).")
+    if (atm_iv is None) or np.isnan(atm_iv) or (atm_iv <= 0):
+        st.info("Could not estimate ATM IV for this expiration (no near-the-money quotes).")
         st.stop()
 
+    # 5) Compute 1σ and 2σ ranges
     ranges = compute_probable_ranges(underlying, atm_iv, days_to_exp)
     if ranges is None:
         st.info("Insufficient data to compute probable levels.")
         st.stop()
 
+    # 6) Headline metrics
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Current SPX (S₀)", f"{ranges['S0']:,.1f}")
@@ -2078,12 +1981,11 @@ with tabs[13]:  # "Probable Levels"
     with col7:
         st.metric("2σ High", f"{ranges['two_sigma_high']:,.1f}")
 
-    # Optional: visualize the range as a band around current price
+    # 7) Distribution sketch (normal approximation around S0)
     st.markdown("### Distribution Sketch (Normal Approximation on Price)")
-    # simple normal approx around S0 for visualization only
-    sd_price = ranges['S0'] * atm_iv * np.sqrt(ranges['T_years'])
-    price_grid = np.linspace(ranges['two_sigma_low'], ranges['two_sigma_high'], 200)
-    pdf = np.exp(-0.5 * ((price_grid - ranges['S0']) / sd_price) ** 2)
+    sd_price = ranges["S0"] * ranges["atm_iv"] * np.sqrt(ranges["T_years"])
+    price_grid = np.linspace(ranges["two_sigma_low"], ranges["two_sigma_high"], 200)
+    pdf = np.exp(-0.5 * ((price_grid - ranges["S0"]) / sd_price) ** 2)
 
     pdf_df = pd.DataFrame({
         "price": price_grid,
@@ -2092,11 +1994,20 @@ with tabs[13]:  # "Probable Levels"
 
     st.line_chart(pdf_df)
     st.caption("Illustrative only: assumes normal distribution on price using ATM IV.")
+
+    # 8) Highest OI / Gamma strikes inside the 1σ band
+    st.markdown("### Highest OI / Gamma Strikes inside 1σ Range")
+
     gravity = top_gravity_levels(
-    df, exp_sel,
-    ranges["one_sigma_low"],
-    ranges["one_sigma_high"],
-    top_n=5
-)
-st.markdown("### Highest OI / Gamma Strikes inside 1σ Range")
-st.dataframe(gravity)
+        df,
+        exp_sel,
+        ranges["one_sigma_low"],
+        ranges["one_sigma_high"],
+        spot,
+        top_n=5,
+    )
+
+    if gravity.empty:
+        st.caption("No strikes in range or no OI/gamma data available.")
+    else:
+        st.dataframe(gravity, use_container_width=True)
