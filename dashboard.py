@@ -1708,21 +1708,23 @@ with col2:
             if df_e.empty:
                 continue
 
-            # ---- Spot detection: use underlying_px from database ----
-
-            if "underlying_px" in df.columns and df["underlying_px"].notna().any():
+            # ---- Approximate underlying close for this snapshot/expiry ----
+            # Prefer real underlying_px if present; fallback to ATM strike proxy
+            if "underlying_px" in df_e.columns and df_e["underlying_px"].notna().any():
                 try:
-                    default_spot = float(df["underlying_px"].dropna().iloc[0])
+                    approx_close = float(df_e["underlying_px"].dropna().iloc[0])
                 except Exception:
-                    default_spot = float(df["strike"].median(skipna=True))
+                    approx_close = float(df_e["strike"].median(skipna=True))
             else:
-                # fallback (rare) – use ATM strike proxy
-                if df["volume"].notna().any():
-                    default_spot = float(df.loc[df["volume"].idxmax(), "strike"])
+                if df_e["volume"].notna().any():
+                    try:
+                        approx_close = float(df_e.loc[df_e["volume"].idxmax(), "strike"])
+                    except Exception:
+                        approx_close = float(df_e["strike"].median(skipna=True))
                 else:
-                    default_spot = float(df["strike"].median(skipna=True))
+                    approx_close = float(df_e["strike"].median(skipna=True))
 
-            # Volume & OI
+            # ---- Volume & OI ----
             vol_call = df_e.loc[df_e["cp"].eq("C"), "volume"].sum()
             vol_put  = df_e.loc[df_e["cp"].eq("P"), "volume"].sum()
             oi_call  = df_e.loc[df_e["cp"].eq("C"), "oi"].sum()
@@ -1732,7 +1734,7 @@ with col2:
             total_oi = oi_call + oi_put
             ratio_oi = oi_call / total_oi if total_oi > 0 else float("nan")
 
-            # Gamma & GEX
+            # ---- Gamma & GEX ----
             df_e["T"] = df_e["expiration_date"].apply(lambda d: yearfrac(snapshot_day, d))
             df_e["sigma"] = pd.to_numeric(df_e["iv"], errors="coerce")
 
@@ -1771,8 +1773,9 @@ with col2:
                 "Net GEX": net_gex,
                 "Contracts": contracts,
                 "Gamma Ratio (C/P)": gr_pc,
-                "Approx Close (ATM)": atm_k,
+                "Approx Close (ATM)": approx_close,  # <- now always defined
             })
+
 
     if not rows:
         st.info("No data available to build the summary.")
