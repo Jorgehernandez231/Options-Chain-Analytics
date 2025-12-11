@@ -168,6 +168,74 @@ def tab_help(md_text: str):
     """Standard inline help expander for each tab."""
     with st.expander("What am I seeing?", expanded=False):
         st.markdown(md_text)
+        
+def get_atm_iv_for_expiry(df, exp_sel, moneyness_band=0.03):
+    """
+    df: chain for one run date
+    exp_sel: selected expiration_date (same type as df['expiration_date'])
+    Returns: (underlying_price, atm_iv) or (underlying_price, None)
+    """
+    dfe = df[df["expiration_date"].eq(exp_sel)].copy()
+    if dfe.empty:
+        return None, None
+
+    # assume underlying is same for all rows that day
+    u = float(dfe["underlying_px"].iloc[0])
+
+    dfe["moneyness"] = dfe["strike"] / u
+    dfe = dfe[dfe["moneyness"].between(1 - moneyness_band, 1 + moneyness_band)]
+
+    if dfe.empty:
+        return u, None
+
+    iv_atm = float(dfe["iv"].median())
+    return u, iv_atm
+
+def compute_probable_ranges(underlying, atm_iv, days_to_exp):
+    """
+    Returns a dict with 1σ and 2σ price ranges.
+    """
+    if atm_iv is None or atm_iv <= 0 or days_to_exp <= 0:
+        return None
+
+    T = max(days_to_exp, 1) / 365.0  # at least 1 day
+    sigma_T = atm_iv * np.sqrt(T)
+
+    move_1s = underlying * sigma_T
+    move_2s = 2.0 * move_1s
+
+    ranges = {
+        "S0": underlying,
+        "T_years": T,
+        "atm_iv": atm_iv,
+        "one_sigma_low": underlying - move_1s,
+        "one_sigma_high": underlying + move_1s,
+        "two_sigma_low": underlying - move_2s,
+        "two_sigma_high": underlying + move_2s,
+    }
+    return ranges
+
+def top_gravity_levels(df, exp_sel, low, high, top_n=5):
+    dfe = df[df["expiration_date"].eq(exp_sel)].copy()
+    u = float(dfe["underlying_px"].iloc[0])
+
+    dfe = dfe[dfe["strike"].between(low, high)]
+
+    # simple “gravity”: OI or gamma * OI
+    if "gamma" in dfe.columns:
+        dfe["gamma_notional"] = dfe["gamma"] * dfe["oi"] * 100 * (u * u)
+        metric_col = "gamma_notional"
+    else:
+        metric_col = "oi"
+
+    out = (
+        dfe.groupby("strike")[metric_col]
+        .sum()
+        .reset_index()
+        .sort_values(metric_col, ascending=False)
+        .head(top_n)
+    )
+    return out
 
 # ---------- Load initial data ----------
 dates = load_run_dates()
@@ -319,7 +387,7 @@ tabs = st.tabs([
     "IV Skew", "OI & Volume", "Gamma (approx)", "Term Structure", "Table",
     "Skew Overlay (Multi-Expiry)", "OI Change (Flows)", "Positioning Tilt",
     "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface",
-    "Summary", "Help & How To Use"
+    "Summary", "Help & How To Use", "Probable Levels"
 ])
 
 
@@ -1844,4 +1912,98 @@ This dashboard is designed to explore **SPX options positioning, volatility and 
 If you hover around long enough, the charts will talk to you. 😄
 """)
     st.markdown("---")
-    st.markdown("© 2024 SPX Terminal. Built with ❤️ using Streamlit.")  
+    st.markdown("© 2024 SPX Terminal. Built with ❤️ using Streamlit.")
+
+# ---- Tab 14: Probable Levels ---- 
+    
+with tabs[13]:  # "Probable Levels"
+    st.subheader("Most Probable SPX Levels (from Options)")
+
+    all_dates = load_run_dates()
+    if not all_dates:
+        st.info("History table not available."); st.stop()
+
+    # Same logic you use everywhere: use chosen_date if history mode, else latest
+    date_cur = chosen_date if (use_hist and chosen_date) else all_dates[0]
+
+    df = load_chain_for_date(date_cur)
+    if df.empty:
+        st.info("No rows for selected date."); st.stop()
+
+    # Pick expiration
+    exps = sorted(df["expiration_date"].unique())
+    exp_sel = st.selectbox("Expiration", exps, key="prob_exp")
+
+    # Parse dates to compute days_to_exp (adapt if your types differ)
+    # If they are already datetime.date, this just works:
+    try:
+        if isinstance(date_cur, str):
+            d0 = pd.to_datetime(date_cur).date()
+        else:
+            d0 = pd.to_datetime(date_cur).date()
+
+        d_exp = pd.to_datetime(exp_sel).date()
+        days_to_exp = (d_exp - d0).days
+    except Exception:
+        # fallback: assume 30 days if parsing fails
+        days_to_exp = 30
+
+    underlying, atm_iv = get_atm_iv_for_expiry(df, exp_sel)
+
+    if underlying is None:
+        st.info("Could not find data for this expiration.")
+        st.stop()
+
+    if atm_iv is None:
+        st.info("Could not estimate ATM IV for this expiration (no near-the-money options).")
+        st.stop()
+
+    ranges = compute_probable_ranges(underlying, atm_iv, days_to_exp)
+    if ranges is None:
+        st.info("Insufficient data to compute probable levels.")
+        st.stop()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Current SPX (S₀)", f"{ranges['S0']:,.1f}")
+    with col2:
+        st.metric("ATM IV", f"{ranges['atm_iv']:.2%}")
+    with col3:
+        st.metric("Days to Expiry", f"{days_to_exp} d")
+
+    st.markdown("### 1σ range (≈68% under normal assumption)")
+    col4, col5 = st.columns(2)
+    with col4:
+        st.metric("1σ Low", f"{ranges['one_sigma_low']:,.1f}")
+    with col5:
+        st.metric("1σ High", f"{ranges['one_sigma_high']:,.1f}")
+
+    st.markdown("### 2σ range (≈95% under normal assumption)")
+    col6, col7 = st.columns(2)
+    with col6:
+        st.metric("2σ Low", f"{ranges['two_sigma_low']:,.1f}")
+    with col7:
+        st.metric("2σ High", f"{ranges['two_sigma_high']:,.1f}")
+
+    # Optional: visualize the range as a band around current price
+    st.markdown("### Distribution Sketch (Normal Approximation on Price)")
+    # simple normal approx around S0 for visualization only
+    sd_price = ranges['S0'] * atm_iv * np.sqrt(ranges['T_years'])
+    price_grid = np.linspace(ranges['two_sigma_low'], ranges['two_sigma_high'], 200)
+    pdf = np.exp(-0.5 * ((price_grid - ranges['S0']) / sd_price) ** 2)
+
+    pdf_df = pd.DataFrame({
+        "price": price_grid,
+        "density": pdf / pdf.max()  # normalize for plotting
+    }).set_index("price")
+
+    st.line_chart(pdf_df)
+    st.caption("Illustrative only: assumes normal distribution on price using ATM IV.")
+    gravity = top_gravity_levels(
+    df, exp_sel,
+    ranges["one_sigma_low"],
+    ranges["one_sigma_high"],
+    top_n=5
+)
+st.markdown("### Highest OI / Gamma Strikes inside 1σ Range")
+st.dataframe(gravity)
