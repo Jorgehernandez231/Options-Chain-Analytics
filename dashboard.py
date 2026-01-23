@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone, timedelta
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from urllib.parse import quote, unquote
 from sqlalchemy import create_engine
+from plotly.subplots import make_subplots
 
 
 
@@ -252,6 +253,45 @@ def top_gravity_levels(df, exp_sel, low, high, spot, top_n=5):
     )
     out = out.rename(columns={metric_col: "position_metric"})
     return out
+
+def compute_oi_change_by_strike(cur_df, prv_df, exp_sel):
+    """
+    Returns DataFrame: strike, oiC, oiP  (OI changes for calls/puts)
+    """
+    key_cols = ["expiration_date", "strike", "cp"]
+
+    cur_e = (
+        cur_df[cur_df["expiration_date"].eq(exp_sel)][key_cols + ["oi"]]
+        .rename(columns={"oi": "oi_cur"})
+    )
+    prv_e = (
+        prv_df[prv_df["expiration_date"].eq(exp_sel)][key_cols + ["oi"]]
+        .rename(columns={"oi": "oi_prev"})
+    )
+
+    merged = pd.merge(cur_e, prv_e, on=key_cols, how="left")
+    merged["oi_cur"]  = pd.to_numeric(merged["oi_cur"], errors="coerce").fillna(0)
+    merged["oi_prev"] = pd.to_numeric(merged["oi_prev"], errors="coerce").fillna(0)
+    merged["oi_change"] = merged["oi_cur"] - merged["oi_prev"]
+
+    # Aggregate to strike x side
+    hm = merged.groupby(["strike", "cp"], as_index=False)["oi_change"].sum()
+
+    # Pivot to columns oiC/oiP
+    out = hm.pivot(index="strike", columns="cp", values="oi_change").fillna(0).reset_index()
+    out = out.rename(columns={"C": "oiC", "P": "oiP"})
+    if "oiC" not in out.columns: out["oiC"] = 0.0
+    if "oiP" not in out.columns: out["oiP"] = 0.0
+    return out.sort_values("strike")
+
+
+def robust_zscore(series: pd.Series) -> pd.Series:
+    """Robust z-score using MAD; good for spiky OI-change distributions."""
+    x = pd.to_numeric(series, errors="coerce").fillna(0.0)
+    med = x.median()
+    mad = (x - med).abs().median()
+    mad = mad if mad > 0 else 1.0
+    return (x - med) / (1.4826 * mad)
 
 # ---------- Load initial data ----------
 dates = load_run_dates()
@@ -723,6 +763,30 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
 
     # --- Controls for style/zoom ---
     colg1, colg2 = st.columns([1, 1])
+       
+        # --- OI Change overlay controls ---
+    st.markdown("##### Overlay")
+    colov1, colov2, colov3 = st.columns([1,1,2])
+    with colov1:
+        overlay_oi = st.checkbox(
+            "Overlay OI change (prev vs current run)",
+            value=True,
+            key="gex_overlay_oi"
+        )
+    with colov2:
+        oi_cap_pct = st.slider(
+            "Cap OI Δ spikes (percentile)",
+            90, 100, 99, 1,
+            key="gex_oi_cap"
+        )
+    with colov3:
+        oi_scale_mode = st.radio(
+            "OI Δ scaling",
+            ["Auto-fit", "Raw (y2)"],
+            horizontal=True,
+            key="gex_oi_scale"
+        )
+
     with colg1:
         zoom_atm = st.checkbox("Zoom around Spot (±%)", value=True, key="gex_zoom")
         band = st.slider("±% around Spot", 2, 50, 10, 1,
@@ -753,6 +817,33 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
         pivot["gamma_put"] = 0.0
 
     pivot = pivot.reset_index().sort_values("strike")
+    
+        # ---- OI Change overlay (same expiry, prev vs current run) ----
+    if overlay_oi:
+        all_dates = load_run_dates()
+        date_cur = chosen_date if (use_hist and chosen_date) else (all_dates[0] if all_dates else None)
+        date_prev = prev_run_date(all_dates, date_cur) if all_dates else None
+
+        if date_cur is not None and date_prev is not None:
+            cur_run, prv_run = load_chain_two_days(date_cur, date_prev)
+
+            cur_run["expiration_date"] = pd.to_datetime(cur_run["expiration_date"]).dt.date
+            prv_run["expiration_date"] = pd.to_datetime(prv_run["expiration_date"]).dt.date
+
+            oi_df = compute_oi_change_by_strike(cur_run, prv_run, exp_sel=exp)
+
+            if oi_cap_pct < 100 and not oi_df.empty:
+                abs_all = pd.concat([oi_df["oiC"].abs(), oi_df["oiP"].abs()])
+                lim = float(np.nanpercentile(abs_all, oi_cap_pct))
+                oi_df["oiC"] = oi_df["oiC"].clip(-lim, lim)
+                oi_df["oiP"] = oi_df["oiP"].clip(-lim, lim)
+
+            pivot = pd.merge(pivot, oi_df, on="strike", how="left").fillna(0.0)
+        else:
+            pivot["oiC"], pivot["oiP"] = 0.0, 0.0
+    else:
+        pivot["oiC"], pivot["oiP"] = 0.0, 0.0
+
 
     # --- Zoom around Spot for plotting ---
     if zoom_atm and np.isfinite(float(spot)):
@@ -798,28 +889,40 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     # --- Plot (bars + orange curve) ---
     fig_gex = go.Figure()
 
-    # Bars for Call / Put / Total
-    fig_gex.add_bar(
-        x=pivot["strike"],
-        y=pivot["gamma_call"],
-        name="Γ Call",
-        marker_color="green",
-    )
-    fig_gex.add_bar(
-        x=pivot["strike"],
-        y=pivot["gamma_put"],
-        name="Γ Put",
-        marker_color="red",
-    )
-    fig_gex.add_bar(
-        x=pivot["strike"],
-        y=pivot["total_gamma"],
-        name="Total Γ",
-        marker_color="purple",
-        opacity=0.6,
+     # --- Plot (two-panel: Gamma on top, OI Δ on bottom) ---
+    fig_gex = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.05,
+        row_heights=[0.72, 0.28],
+        specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
     )
 
-    # Cumulative curve (orange) on second y-axis
+    # ---------- TOP PANEL: Gamma ----------
+    # Make call/put thinner + slightly transparent; keep Total more visible
+    fig_gex.add_bar(
+        row=1, col=1,
+        x=pivot["strike"], y=pivot["gamma_call"],
+        name="Γ Call",
+        marker_color="green",
+        opacity=0.55,
+    )
+    fig_gex.add_bar(
+        row=1, col=1,
+        x=pivot["strike"], y=pivot["gamma_put"],
+        name="Γ Put",
+        marker_color="red",
+        opacity=0.55,
+    )
+    fig_gex.add_bar(
+        row=1, col=1,
+        x=pivot["strike"], y=pivot["total_gamma"],
+        name="Total Γ",
+        marker_color="purple",
+        opacity=0.85,
+    )
+
+    # Cumulative curve on secondary y (right) — TOP PANEL
     fig_gex.add_scatter(
         x=pivot["strike"],
         y=pivot["cum_gamma"],
@@ -829,7 +932,37 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
         yaxis="y2",
     )
 
-    # Flip vertical line (only if sign change exists)
+    # ---------- BOTTOM PANEL: OI Change ----------
+    if overlay_oi:
+        oiC = pivot.get("oiC", pd.Series(0, index=pivot.index)).astype(float)
+        oiP = pivot.get("oiP", pd.Series(0, index=pivot.index)).astype(float)
+
+        # Cap for display (try 97 or 95 if still flat)
+        lim2 = float(np.nanpercentile(np.abs(pd.concat([oiC, oiP])), 97))
+        lim2 = max(lim2, 1.0)
+
+        pivot["oiC_plot"] = oiC.clip(-lim2, lim2)
+        pivot["oiP_plot"] = oiP.clip(-lim2, lim2)
+
+        fig_gex.add_bar(
+            row=2, col=1,
+            x=pivot["strike"], y=pivot["oiC_plot"],
+            name="OI Δ Call (capped)",
+            marker_color="rgba(30,144,255,0.75)",
+            opacity=0.75,
+        )
+        fig_gex.add_bar(
+            row=2, col=1,
+            x=pivot["strike"], y=pivot["oiP_plot"],
+            name="OI Δ Put (capped)",
+            marker_color="rgba(255,69,0,0.75)",
+            opacity=0.75,
+        )
+
+        # Add a zero-line to read OI Δ easier
+        fig_gex.add_hline(row=2, col=1, y=0, line_dash="dot", line_width=1, opacity=0.5)
+
+    # ---------- Flip line (top panel) ----------
     if flip_strike is not None:
         fig_gex.add_vline(
             x=flip_strike,
@@ -837,15 +970,8 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
             line_width=2,
             line_color="yellow",
         )
-        fig_gex.add_annotation(
-            x=flip_strike,
-            y=pivot["cum_gamma"].min(),
-            text=f"Flip ~ {flip_strike:.0f}",
-            showarrow=False,
-            yshift=20,
-        )
 
-    # Spot line (cyan dotted)
+    # ---------- Spot line (both panels) ----------
     try:
         s_val = float(spot)
         fig_gex.add_vline(
@@ -857,23 +983,76 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     except Exception:
         pass
 
+    # ---------- Make it readable ----------
+    # 1) Put the legend on top; 2) Overlay bars within each panel
     fig_gex.update_layout(
         template=PX_TEMPLATE,
-        title="Gamma by Strike (Calls / Puts / Total) + Cumulative Curve",
+        title="Gamma by Strike + OI Change (Two-Panel View)",
         barmode="group",
+        bargap=0.10,
         hovermode="x unified",
-        xaxis=dict(title="Strike"),
-        yaxis=dict(title=y_title),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+
+        yaxis=dict(
+            title="Gamma Exposure (per strike)",
+            zeroline=True,
+        ),
         yaxis2=dict(
-            title=y2_title,
+            title="Cumulative Gamma",
             overlaying="y",
             side="right",
             showgrid=False,
         ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
     )
 
+    # Axis labels
+    fig_gex.update_yaxes(title_text=y_title, row=1, col=1)
+    fig_gex.update_yaxes(title_text=y2_title, row=1, col=1, secondary_y=True)
+    fig_gex.update_yaxes(title_text="OI Change (contracts)", row=2, col=1)
+    fig_gex.update_xaxes(title_text="Strike", row=2, col=1)
+    fig_gex.update_yaxes(range=[-lim2, lim2], row=2, col=1)
+    
     st.plotly_chart(fig_gex, use_container_width=True)
+
+    st.markdown("### Intraday Decision Tree (Gamma + OI)")
+
+    pv = pivot.sort_values("strike").copy()
+    pv["oi_abs"] = pv["oiC"].abs() + pv["oiP"].abs()
+    pv["oi_z"] = robust_zscore(pv["oi_abs"])
+
+    short_gamma = (pv["total_gamma"].sum() < 0)
+    pv_reset = pv.reset_index(drop=True)
+    i = int((pv_reset["strike"] - float(spot)).abs().idxmin())
+    slope = pv_reset["cum_gamma"].iloc[min(i+3,len(pv_reset)-1)] - pv_reset["cum_gamma"].iloc[max(i-3,0)]
+
+    regime = short_gamma and slope < 0
+
+    cliff_thr = np.nanpercentile(pv_reset["total_gamma"], 10)
+    cliffs = pv_reset[pv_reset["total_gamma"] <= cliff_thr]
+    K_star = float(
+        cliffs.loc[(cliffs["strike"] - float(spot)).abs().idxmin(), "strike"]
+        if not cliffs.empty else pv_reset.iloc[i]["strike"]
+    )
+
+    active = pv_reset[pv_reset["oi_z"] >= 2.0]
+
+    up = active[(active["strike"] >= spot) & (active["strike"] <= spot + 150)]
+    dn = active[(active["strike"] <= spot) & (active["strike"] >= spot - 150)]
+
+    UpCall, UpPut = up["oiC"].clip(lower=0).sum(), up["oiP"].clip(lower=0).sum()
+    DnCall, DnPut = dn["oiC"].clip(lower=0).sum(), dn["oiP"].clip(lower=0).sum()
+
+    if UpCall > UpPut * 1.5:
+        bias = "Upside squeeze risk"
+    elif DnPut > DnCall * 1.5:
+        bias = "Downside continuation risk"
+    else:
+        bias = "Mixed / neutral"
+
+    cA, cB, cC = st.columns(3)
+    cA.metric("Gamma regime", "SHORT GAMMA" if regime else "Not clear")
+    cB.metric("Decision strike (K*)", f"{K_star:.0f}")
+    cC.metric("Flow bias", bias)
 
 
 # ---- Tab 4: Term Structure ----
