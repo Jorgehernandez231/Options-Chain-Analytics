@@ -213,10 +213,14 @@ def extract_underlying_px(data):
     data_block = data.get("data", {})
 
     return to_float(
-        data_block.get("underlying_price")
+        data_block.get("current_price")
+        or data_block.get("close")
+        or data_block.get("underlying_price")
         or data_block.get("underlying_last")
         or data_block.get("underlying")
         or data_block.get("last")
+        or data_block.get("index_price")
+        or data_block.get("price")
     )
 
 
