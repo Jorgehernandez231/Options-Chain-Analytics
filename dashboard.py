@@ -391,6 +391,76 @@ def robust_zscore(series: pd.Series) -> pd.Series:
     mad = mad if mad > 0 else 1.0
     return (x - med) / (1.4826 * mad)
 
+def render_dashboard_status(
+    selected_symbol,
+    chosen_date,
+    previous_date,
+    df,
+    exp,
+    spot,
+):
+    """
+    Compact dashboard status section showing snapshot freshness and data coverage.
+    """
+
+    contracts_loaded = len(df)
+
+    rows_with_underlying = (
+        df["underlying_px"].notna().sum()
+        if "underlying_px" in df.columns
+        else 0
+    )
+
+    rows_with_delta = (
+        df["delta"].notna().sum()
+        if "delta" in df.columns
+        else 0
+    )
+
+    rows_with_gamma = (
+        df["gamma"].notna().sum()
+        if "gamma" in df.columns
+        else 0
+    )
+
+    selected_ts = (
+        pd.to_datetime(chosen_date).strftime("%Y-%m-%d %H:%M UTC")
+        if chosen_date is not None
+        else "Latest"
+    )
+
+    previous_ts = (
+        pd.to_datetime(previous_date).strftime("%Y-%m-%d %H:%M UTC")
+        if previous_date is not None
+        else "N/A"
+    )
+
+    st.markdown("### Dashboard Status")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Symbol", selected_symbol)
+    c2.metric("Selected snapshot", selected_ts)
+    c3.metric("Previous snapshot", previous_ts)
+    c4.metric("Contracts loaded", f"{contracts_loaded:,}")
+
+    c5, c6, c7, c8 = st.columns(4)
+
+    c5.metric("Expiration", str(exp))
+    c6.metric("Spot", f"{float(spot):,.2f}")
+    c7.metric("Rows with delta", f"{rows_with_delta:,}")
+    c8.metric("Rows with gamma", f"{rows_with_gamma:,}")
+
+    if contracts_loaded > 0:
+        underlying_cov = rows_with_underlying / contracts_loaded
+        delta_cov = rows_with_delta / contracts_loaded
+        gamma_cov = rows_with_gamma / contracts_loaded
+
+        st.caption(
+            f"Data coverage — underlying_px: {underlying_cov:.1%} · "
+            f"delta: {delta_cov:.1%} · gamma: {gamma_cov:.1%}"
+        )
+
 # ---------- Load initial data ----------
 dates = load_run_dates(symbol)
 
@@ -512,6 +582,17 @@ if kH is None: kH = max_k
 k_low, k_high = st.slider("Strike range", min_value=float(min_k), max_value=float(max_k),
                           value=(float(kL), float(kH)), step=5.0)
 dfe = dfe[(dfe["strike"]>=k_low)&(dfe["strike"]<=k_high)]
+
+previous_snapshot = prev_run_date(dates, chosen_date) if chosen_date else None
+
+render_dashboard_status(
+    selected_symbol=selected_symbol,
+    chosen_date=chosen_date,
+    previous_date=previous_snapshot,
+    df=df,
+    exp=exp,
+    spot=spot,
+)
 
 # ---------- Sidebar: Permalink ----------
 st.sidebar.markdown("---")
