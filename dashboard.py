@@ -195,7 +195,10 @@ def load_chain_by_run(symbol, run_ts):
                ask,
                volume,
                oi,
-               iv
+               iv,
+               delta,
+               gamma,
+               option_net
         FROM {OPTIONS_TABLE}
         WHERE symbol = %s
           AND run_ts = %s
@@ -220,7 +223,10 @@ def load_latest(symbol):
                ask,
                volume,
                oi,
-               iv
+               iv,
+               delta,
+               gamma,
+               option_net
         FROM {OPTIONS_TABLE}
         WHERE symbol = %s
           AND run_ts = (
@@ -326,10 +332,12 @@ def top_gravity_levels(df, exp_sel, low, high, spot, top_n=5):
     if dfe.empty:
         return pd.DataFrame(columns=["strike", "position_metric"])
 
-    # If gamma exists, use gamma_notional; otherwise fall back to OI
+    # If stored gamma exists, use absolute gamma notional; otherwise fall back to OI.
     if "gamma" in dfe.columns and dfe["gamma"].notna().any():
         u = float(spot)
-        dfe["gamma_notional"] = dfe["gamma"] * dfe["oi"] * 100 * (u * u)
+        dfe["gamma"] = pd.to_numeric(dfe["gamma"], errors="coerce").fillna(0.0)
+        dfe["oi"] = pd.to_numeric(dfe["oi"], errors="coerce").fillna(0.0)
+        dfe["gamma_notional"] = dfe["gamma"].abs() * dfe["oi"] * CONTRACT_MULT * (u * u)
         metric_col = "gamma_notional"
     else:
         metric_col = "oi"
@@ -430,7 +438,7 @@ if df.empty:
 
 # Dtypes
 df["expiration_date"] = pd.to_datetime(df["expiration_date"]).dt.date
-for c in ["strike","last","bid","ask","iv","volume","oi","underlying_px"]:
+for c in ["strike", "last", "bid", "ask", "iv", "volume", "oi", "underlying_px", "delta", "gamma", "option_net"]:
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -808,7 +816,7 @@ with tabs[2]:
 
 An approximation of **dealer gamma exposure (GEX)** across strikes:
 
-- Computes **option gamma** via a Black–Scholes-style formula.  
+- Uses **Cboe-provided option gamma** when available, with a Black–Scholes fallback.  
 - Multiplies by **Open Interest** and a contract multiplier to estimate a **notional gamma** per strike.  
 - Aggregates into **Call Γ**, **Put Γ**, **Total Γ**, plus a **cumulative curve**.
 
@@ -877,12 +885,29 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     g["T"] = g["expiration_date"].apply(lambda d: yearfrac(today, d))
     g["sigma"] = pd.to_numeric(g["iv"], errors="coerce")
 
-    g["gamma"] = g.apply(
-        lambda r2: bs_gamma(spot, r2["strike"], r, r2["sigma"], r2["T"])
-        if (r2["sigma"] and r2["sigma"] > 0 and r2["T"] > 0) else 0.0,
-        axis=1,
-    )
-    g["gex"] = -g["gamma"] * g["oi"].fillna(0) * CONTRACT_MULT * (spot ** 2)
+    # Prefer Cboe-provided gamma when available.
+    # Fallback to Black-Scholes gamma if stored gamma is missing.
+    if "gamma" in g.columns and g["gamma"].notna().any():
+        g["gamma_calc"] = pd.to_numeric(g["gamma"], errors="coerce")
+    else:
+        g["gamma_calc"] = np.nan
+
+    missing_gamma = g["gamma_calc"].isna()
+
+    if missing_gamma.any():
+        g.loc[missing_gamma, "gamma_calc"] = g.loc[missing_gamma].apply(
+            lambda r2: bs_gamma(spot, r2["strike"], r, r2["sigma"], r2["T"])
+            if (
+                pd.notna(r2["sigma"])
+                and r2["sigma"] > 0
+                and r2["T"] > 0
+            )
+            else 0.0,
+            axis=1,
+        )
+
+    g["gamma_calc"] = g["gamma_calc"].fillna(0.0)
+    g["gex"] = -g["gamma_calc"] * g["oi"].fillna(0) * CONTRACT_MULT * (spot ** 2)
 
     # --- Aggregate by strike / cp ---
     grp = g.groupby(["strike", "cp"], as_index=False)["gex"].sum()
@@ -1010,6 +1035,7 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     )
 
     # ---------- BOTTOM PANEL: OI Change ----------
+    lim2 = 1.0
     if overlay_oi:
         oiC = pivot.get("oiC", pd.Series(0, index=pivot.index)).astype(float)
         oiP = pivot.get("oiP", pd.Series(0, index=pivot.index)).astype(float)
@@ -1285,8 +1311,14 @@ This tab is your **X-ray** for the rest of the dashboard.
 """)
 
 
-    cols = ["expiration_date","cp","strike","bid","ask","last","iv","volume","oi"]
-    st.dataframe(dfe[cols].sort_values(["cp","strike"]), use_container_width=True, height=420)
+    cols = [
+        "expiration_date", "cp", "strike",
+        "bid", "ask", "last",
+        "iv", "delta", "gamma", "option_net",
+        "volume", "oi",
+    ]
+    cols = [c for c in cols if c in dfe.columns]
+    st.dataframe(dfe[cols].sort_values(["cp", "strike"]), use_container_width=True, height=420)
 
 # ---- Tab 6: Skew Overlay (Multi-Expiry) ----
 with tabs[5]:
@@ -1941,7 +1973,7 @@ Use this tab as your **dashboard of dashboards**:
             continue
 
         df_run["expiration_date"] = pd.to_datetime(df_run["expiration_date"]).dt.date
-        for c in ["strike", "iv", "volume", "oi"]:
+        for c in ["strike", "iv", "volume", "oi", "underlying_px", "delta", "gamma", "option_net"]:
             if c in df_run.columns:
                 df_run[c] = pd.to_numeric(df_run[c], errors="coerce")
 
@@ -1994,11 +2026,26 @@ Use this tab as your **dashboard of dashboards**:
             df_e["T"] = df_e["expiration_date"].apply(lambda d: yearfrac(snapshot_day, d))
             df_e["sigma"] = pd.to_numeric(df_e["iv"], errors="coerce")
 
-            df_e["gamma_unit"] = df_e.apply(
-                lambda r2: bs_gamma(spot_used, r2["strike"], r_used, r2["sigma"], r2["T"])
-                if (r2["sigma"] and r2["sigma"] > 0 and r2["T"] > 0) else 0.0,
-                axis=1,
-            )
+            if "gamma" in df_e.columns and df_e["gamma"].notna().any():
+                df_e["gamma_unit"] = pd.to_numeric(df_e["gamma"], errors="coerce")
+            else:
+                df_e["gamma_unit"] = np.nan
+
+            missing_gamma = df_e["gamma_unit"].isna()
+
+            if missing_gamma.any():
+                df_e.loc[missing_gamma, "gamma_unit"] = df_e.loc[missing_gamma].apply(
+                    lambda r2: bs_gamma(spot_used, r2["strike"], r_used, r2["sigma"], r2["T"])
+                    if (
+                        pd.notna(r2["sigma"])
+                        and r2["sigma"] > 0
+                        and r2["T"] > 0
+                    )
+                    else 0.0,
+                    axis=1,
+                )
+
+            df_e["gamma_unit"] = df_e["gamma_unit"].fillna(0.0)
 
             df_e["gex"] = -df_e["gamma_unit"] * df_e["oi"].fillna(0) * CONTRACT_MULT * (spot_used ** 2)
 
@@ -2125,7 +2172,7 @@ This dashboard is designed to explore **SPX options positioning, volatility and 
 
 **Table**
 - Raw table of contracts for the selected expiration & filters:
-  - `expiration_date, cp, strike, bid, ask, last, iv, volume, oi`.
+  - `expiration_date, cp, strike, bid, ask, last, iv, delta, gamma, option_net, volume, oi`.
 - Good for **sanity checks** and manual inspection.
 
 **Skew Overlay (Multi-Expiry)**
