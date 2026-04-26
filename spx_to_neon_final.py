@@ -23,7 +23,7 @@ except Exception:
 TABLE = "options_chain"
 RETENTION_DAYS = 4
 
-SYMBOLS_TO_RUN = ["SPX"]
+SYMBOLS_TO_RUN = ["SPX", "NDX", "VIX"]
 
 SOURCES = {
     "SPX": {
@@ -34,14 +34,15 @@ SOURCES = {
     "NDX": {
         "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/_NDX.json",
         "referer": "https://www.cboe.com/delayed_quotes/ndx/quote_table",
-        "opra_regex": re.compile(r"NDX\w?(\d{6})([CP])(\d{8})"),
+        "opra_regex": re.compile(r"NDXP?(\d{6})([CP])(\d{8})"),
     },
     "VIX": {
-        "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/VIX.json",
+        "url": "https://cdn.cboe.com/api/global/delayed_quotes/options/_VIX.json",
         "referer": "https://www.cboe.com/delayed_quotes/vix/quote_table",
-        "opra_regex": re.compile(r"VIX\w?(\d{6})([CP])(\d{8})"),
+        "opra_regex": re.compile(r"VIXW?(\d{6})([CP])(\d{8})"),
     },
 }
+
 
 INSERT_COLUMNS = [
     "symbol",
@@ -178,9 +179,16 @@ def parse_opra(code, opra_regex):
 
 def build_headers(referer):
     return {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Referer": referer,
+        "Origin": "https://www.cboe.com",
+        "Connection": "keep-alive",
     }
 
 
