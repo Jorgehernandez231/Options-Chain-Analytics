@@ -556,15 +556,227 @@ def add_spot_line(fig, spot, x_is_moneyness=False):
 
 # ---------- Tabs ----------
 tabs = st.tabs([
+    "Quick Market Read",
     "IV Skew", "OI & Volume", "Gamma (approx)", "Term Structure", "Table",
     "Skew Overlay (Multi-Expiry)", "OI Change (Flows)", "Positioning Tilt",
     "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface",
     "Summary", "Help & How To Use", "Probable Levels"
 ])
 
-
-# ---- Tab 1: IV Skew ----
+# ---- Tab 0: Quick Market Read ----
 with tabs[0]:
+    st.subheader(f"Quick Market Read — {selected_symbol}")
+
+    st.caption(
+        "Rule-based summary from the selected options snapshot. "
+        "This is an analytical overview, not a trading signal or price prediction."
+    )
+
+    # ---------- 1. Largest OI and Volume levels ----------
+    oi_levels = (
+        dfe.groupby("strike", as_index=False)["oi"]
+        .sum()
+        .sort_values("oi", ascending=False)
+        .head(5)
+    )
+
+    volume_levels = (
+        dfe.groupby("strike", as_index=False)["volume"]
+        .sum()
+        .sort_values("volume", ascending=False)
+        .head(5)
+    )
+
+    # ---------- 2. ATM IV and probable range ----------
+    atm_iv = nearest_strike_iv(df, exp, float(spot))
+    dte = max((exp - date.today()).days, 1)
+
+    if np.isfinite(atm_iv) and atm_iv > 0:
+        T = dte / 365.0
+        one_sigma_move = float(spot) * atm_iv * np.sqrt(T)
+        two_sigma_move = 2.0 * one_sigma_move
+
+        one_sigma_low = float(spot) - one_sigma_move
+        one_sigma_high = float(spot) + one_sigma_move
+        two_sigma_low = float(spot) - two_sigma_move
+        two_sigma_high = float(spot) + two_sigma_move
+    else:
+        one_sigma_move = np.nan
+        two_sigma_move = np.nan
+        one_sigma_low = np.nan
+        one_sigma_high = np.nan
+        two_sigma_low = np.nan
+        two_sigma_high = np.nan
+
+    # ---------- 3. Gamma regime ----------
+    g_read = dfe.copy()
+    g_read["oi"] = pd.to_numeric(g_read["oi"], errors="coerce").fillna(0.0)
+
+    if "gamma" in g_read.columns and g_read["gamma"].notna().any():
+        g_read["gamma_used"] = pd.to_numeric(g_read["gamma"], errors="coerce").fillna(0.0)
+        gamma_source = "Stored Cboe gamma"
+    else:
+        today_read = date.today()
+        g_read["T"] = g_read["expiration_date"].apply(lambda d: yearfrac(today_read, d))
+        g_read["sigma"] = pd.to_numeric(g_read["iv"], errors="coerce")
+
+        g_read["gamma_used"] = g_read.apply(
+            lambda row: bs_gamma(float(spot), row["strike"], float(r), row["sigma"], row["T"])
+            if (
+                pd.notna(row["sigma"])
+                and row["sigma"] > 0
+                and row["T"] > 0
+            )
+            else 0.0,
+            axis=1,
+        )
+        gamma_source = "Black-Scholes fallback"
+
+    g_read["gex"] = -g_read["gamma_used"] * g_read["oi"] * CONTRACT_MULT * (float(spot) ** 2)
+    total_gex = g_read["gex"].sum()
+
+    if total_gex > 0:
+        gamma_regime = "Long gamma bias"
+        gamma_comment = "May suggest more mean-reverting conditions around the selected strikes."
+    elif total_gex < 0:
+        gamma_regime = "Short gamma bias"
+        gamma_comment = "May suggest more directional or unstable conditions around the selected strikes."
+    else:
+        gamma_regime = "Mixed / unclear"
+        gamma_comment = "Gamma exposure is too balanced to classify clearly."
+
+    # ---------- 4. OI change / flow bias ----------
+    flow_bias = "N/A"
+    biggest_flows = pd.DataFrame()
+
+    all_dates_qmr = load_run_dates(symbol)
+    date_cur_qmr = chosen_date if (use_hist and chosen_date) else (all_dates_qmr[0] if all_dates_qmr else None)
+    date_prev_qmr = prev_run_date(all_dates_qmr, date_cur_qmr) if all_dates_qmr else None
+
+    if date_cur_qmr is not None and date_prev_qmr is not None:
+        cur_qmr, prv_qmr = load_chain_two_days(symbol, date_cur_qmr, date_prev_qmr)
+
+        cur_qmr["expiration_date"] = pd.to_datetime(cur_qmr["expiration_date"]).dt.date
+        prv_qmr["expiration_date"] = pd.to_datetime(prv_qmr["expiration_date"]).dt.date
+
+        flows_qmr = compute_oi_change_by_strike(cur_qmr, prv_qmr, exp)
+
+        if not flows_qmr.empty:
+            flows_qmr["total_abs_flow"] = flows_qmr["oiC"].abs() + flows_qmr["oiP"].abs()
+
+            biggest_flows = (
+                flows_qmr.sort_values("total_abs_flow", ascending=False)
+                .head(10)
+            )
+
+            near_spot = flows_qmr[
+                flows_qmr["strike"].between(float(spot) * 0.97, float(spot) * 1.03)
+            ].copy()
+
+            if not near_spot.empty:
+                call_add = near_spot["oiC"].clip(lower=0).sum()
+                put_add = near_spot["oiP"].clip(lower=0).sum()
+
+                if call_add > put_add * 1.5:
+                    flow_bias = "Upside call activity may be stronger near spot"
+                elif put_add > call_add * 1.5:
+                    flow_bias = "Downside put activity may be stronger near spot"
+                else:
+                    flow_bias = "Mixed / balanced near-spot flow"
+            else:
+                flow_bias = "No major near-spot OI-change cluster"
+    else:
+        flow_bias = "Need at least two snapshots"
+
+    # ---------- 5. Headline metrics ----------
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Gamma regime", gamma_regime)
+    c2.metric("ATM IV", f"{atm_iv:.2%}" if np.isfinite(atm_iv) else "N/A")
+    c3.metric("DTE", f"{dte} d")
+    c4.metric("1σ move", f"±{one_sigma_move:,.2f}" if np.isfinite(one_sigma_move) else "N/A")
+
+    st.caption(f"{gamma_comment} Gamma source: {gamma_source}.")
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Spot", f"{float(spot):,.2f}")
+    c6.metric("Total GEX", f"{total_gex / 1_000_000:,.2f}M")
+    c7.metric("Flow bias", flow_bias)
+
+    # ---------- 6. Probable levels ----------
+    st.markdown("### IV-Based Probable Range")
+
+    range_df = pd.DataFrame([
+        {
+            "Range": "1σ",
+            "Low": one_sigma_low,
+            "High": one_sigma_high,
+            "Expected Move": one_sigma_move,
+        },
+        {
+            "Range": "2σ",
+            "Low": two_sigma_low,
+            "High": two_sigma_high,
+            "Expected Move": two_sigma_move,
+        },
+    ])
+
+    st.dataframe(
+        range_df.style.format({
+            "Low": "{:,.2f}",
+            "High": "{:,.2f}",
+            "Expected Move": "{:,.2f}",
+        }),
+        use_container_width=True,
+        height=120,
+    )
+
+    # ---------- 7. Key levels ----------
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        st.markdown("### Largest OI Strikes")
+        st.dataframe(
+            oi_levels.style.format({"strike": "{:,.2f}", "oi": "{:,.0f}"}),
+            use_container_width=True,
+            height=220,
+        )
+
+    with col_b:
+        st.markdown("### Largest Volume Strikes")
+        st.dataframe(
+            volume_levels.style.format({"strike": "{:,.2f}", "volume": "{:,.0f}"}),
+            use_container_width=True,
+            height=220,
+        )
+
+    # ---------- 8. Biggest OI changes ----------
+    st.markdown("### Biggest OI Changes")
+
+    if biggest_flows.empty:
+        st.info("No previous snapshot available for OI-change analysis.")
+    else:
+        st.dataframe(
+            biggest_flows[
+                ["strike", "oiC", "oiP", "total_abs_flow"]
+            ].style.format({
+                "strike": "{:,.2f}",
+                "oiC": "{:,.0f}",
+                "oiP": "{:,.0f}",
+                "total_abs_flow": "{:,.0f}",
+            }),
+            use_container_width=True,
+            height=300,
+        )
+
+    if selected_symbol == "VIX":
+        st.info(
+            "VIX is a volatility index. Interpret probable levels and gamma regime as volatility-index analytics, "
+            "not equity-index price behavior."
+        )
+        
+# ---- Tab 1: IV Skew ----
+with tabs[1]:
     st.subheader("Volatility Skew")
     tab_help("""
 **What this shows**
@@ -730,7 +942,7 @@ You can see **Calls vs Puts**, optional **smoothed lines** (LOWESS), and a **mid
 
 
 # ---- Tab 2: OI & Volume ----
-with tabs[1]:
+with tabs[2]:
     st.subheader("Open Interest & Volume")
     tab_help("""
 **What this shows**
@@ -828,7 +1040,7 @@ Use this tab to quickly answer:
 
 
 # ---- Tab 3: Gamma (approx) ----
-with tabs[2]:
+with tabs[3]:
     st.subheader("Dealer Gamma Exposure (approx)")
     tab_help("""
 **What this shows**
@@ -1178,7 +1390,7 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
 
 
 # ---- Tab 4: Term Structure ----
-with tabs[3]:
+with tabs[4]:
     st.subheader("ATM IV Term Structure")
     tab_help("""
 **What this shows**
@@ -1307,7 +1519,7 @@ This is the **term structure of volatility**: how expensive options are by horiz
     st.plotly_chart(fig_t, use_container_width=True)
 
 # ---- Tab 5: Table ----
-with tabs[4]:
+with tabs[5]:
     st.subheader("Contracts")
     tab_help("""
 **What this shows**
@@ -1340,7 +1552,7 @@ This tab is your **X-ray** for the rest of the dashboard.
     st.dataframe(dfe[cols].sort_values(["cp", "strike"]), use_container_width=True, height=420)
 
 # ---- Tab 6: Skew Overlay (Multi-Expiry) ----
-with tabs[5]:
+with tabs[6]:
     st.subheader("Multi-Expiry Skew Overlay (IV vs Strike or Moneyness)")
     tab_help("""
 **What this shows**
@@ -1472,7 +1684,7 @@ This tab is great for spotting **which expiries are “doing something different
     st.plotly_chart(fig, use_container_width=True)
 
 # ---- Tab 7: OI Change (Flows) ----
-with tabs[6]:
+with tabs[7]:
     st.subheader("Open Interest Change (Day-over-Day)")
     tab_help("""
 **What this shows**
@@ -1625,7 +1837,7 @@ Think of this as your **flow radar**: “Where did the book meaningfully change 
 
 
 # ---- Tab 8: Positioning Tilt ----
-with tabs[7]:
+with tabs[8]:
     st.subheader("Net Positioning Tilt (Call OI − Put OI)")
     tab_help("""
 **What this shows**
@@ -1668,7 +1880,7 @@ Use this tab for a quick visual answer to:
     st.dataframe(tilt.tail(100), use_container_width=True, height=320)
 
 # ---- Tab 9: Spread Detector ----
-with tabs[8]:
+with tabs[9]:
     st.subheader("Spread Detector (heuristic)")
     tab_help("""
 **What this shows**
@@ -1764,7 +1976,7 @@ Use this as a **starting point**:
     st.caption("Heuristic detector — use as leads, not definitive classification.")
 
 # ---- Tab 10: Skew Today vs Yesterday ----
-with tabs[9]:
+with tabs[10]:
     st.subheader("Skew Overlay: Today vs Yesterday")
     tab_help("""
 **What this shows**
@@ -1866,7 +2078,7 @@ This tab answers:
     st.plotly_chart(fig, use_container_width=True)
 
 # ---- Tab 11: 3D Vol Surface ----
-with tabs[10]:
+with tabs[11]:
     st.subheader("3D Volatility Surface (Moneyness × DTE × IV)")
     tab_help("""
 **What this shows**
@@ -1917,7 +2129,7 @@ Use this for an overall **gestalt**:
     st.plotly_chart(fig, use_container_width=True)
 
 # ---- Tab 12: Summary (Volume, OI, Gamma, GEX) ----
-with tabs[11]:
+with tabs[12]:
     st.subheader("Daily Summary by Expiration (Volume, OI, Gamma, GEX)")
     tab_help("""
 **What this shows**
@@ -2129,7 +2341,7 @@ Use this tab as your **dashboard of dashboards**:
     st.dataframe(summary_df, use_container_width=True, height=540)
 
 # ---- Tab 13: Help & How To Use ----
-with tabs[12]:
+with tabs[13]:
     st.subheader(f"How to Use {selected_symbol} Terminal")
 
     st.markdown("""
@@ -2273,7 +2485,7 @@ If you hover around long enough, the charts will talk to you. 😄
 
 # ---- Tab 14: Probable Levels ---- 
 
-with tabs[13]:  # "Probable Levels"
+with tabs[14]:  # "Probable Levels"
     st.subheader(f"Most Probable {selected_symbol} Levels (from Options)")
 
     # 1) Pricing date (today vs chosen history snapshot)
