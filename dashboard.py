@@ -557,6 +557,7 @@ def add_spot_line(fig, spot, x_is_moneyness=False):
 # ---------- Tabs ----------
 tabs = st.tabs([
     "Quick Market Read",
+    "Delta Analytics",
     "IV Skew", "OI & Volume", "Gamma (approx)", "Term Structure", "Table",
     "Skew Overlay (Multi-Expiry)", "OI Change (Flows)", "Positioning Tilt",
     "Spread Detector", "Skew: Today vs Yesterday", "3D Vol Surface",
@@ -774,9 +775,297 @@ with tabs[0]:
             "VIX is a volatility index. Interpret probable levels and gamma regime as volatility-index analytics, "
             "not equity-index price behavior."
         )
-        
-# ---- Tab 1: IV Skew ----
+
+# ---- Tab 1: Delta Analytics ----
 with tabs[1]:
+    st.subheader(f"Delta Analytics — {selected_symbol}")
+
+    tab_help("""
+**What this shows**
+
+This tab uses option **delta** to analyze the chain by sensitivity rather than only by strike.
+
+Key ideas:
+
+- **Delta** measures how much an option price changes for a 1-point move in the underlying.
+- Calls usually have positive delta, puts usually have negative delta, although some data vendors report puts as positive absolute values.
+- **25-delta options** are commonly used to compare call and put skew.
+- **Risk reversal** compares upside call IV vs downside put IV.
+
+Useful questions:
+
+- Are 25-delta puts more expensive than 25-delta calls?
+- Where is open interest concentrated by delta zone?
+- Is current activity mostly ATM, OTM, or deep OTM?
+""")
+
+    if "delta" not in df.columns:
+        st.info("Delta column is not available in the current data.")
+        st.stop()
+
+    delta_df = df[df["expiration_date"].eq(exp)].copy()
+
+    if delta_df.empty:
+        st.info("No data available for the selected expiration.")
+        st.stop()
+
+    for c in ["delta", "iv", "volume", "oi", "strike"]:
+        if c in delta_df.columns:
+            delta_df[c] = pd.to_numeric(delta_df[c], errors="coerce")
+
+    delta_df = delta_df.dropna(subset=["delta", "iv", "strike"])
+
+    if delta_df.empty:
+        st.info("No valid delta/IV data available for this expiration.")
+        st.stop()
+
+    # Cboe often reports put delta as positive absolute value.
+    # We create a normalized delta convention:
+    # calls: positive delta
+    # puts: negative delta
+    delta_df["delta_signed"] = np.where(
+        delta_df["cp"].eq("P"),
+        -delta_df["delta"].abs(),
+        delta_df["delta"].abs(),
+    )
+
+    delta_df["abs_delta"] = delta_df["delta_signed"].abs()
+
+    # ---------- Controls ----------
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        target_delta = st.slider(
+            "Target delta",
+            min_value=0.05,
+            max_value=0.50,
+            value=0.25,
+            step=0.01,
+            key="delta_target",
+            help="Common market convention: 25-delta skew / risk reversal.",
+        )
+
+    with c2:
+        min_oi_filter = st.number_input(
+            "Min OI filter",
+            min_value=0,
+            value=0,
+            step=10,
+            key="delta_min_oi",
+        )
+
+    with c3:
+        min_volume_filter = st.number_input(
+            "Min volume filter",
+            min_value=0,
+            value=0,
+            step=10,
+            key="delta_min_volume",
+        )
+
+    delta_df = delta_df[
+        (delta_df["oi"].fillna(0) >= min_oi_filter)
+        & (delta_df["volume"].fillna(0) >= min_volume_filter)
+    ].copy()
+
+    if delta_df.empty:
+        st.info("No contracts remain after the selected OI/volume filters.")
+        st.stop()
+
+    # ---------- 25-delta call / put IV ----------
+    calls_d = delta_df[delta_df["cp"].eq("C")].copy()
+    puts_d = delta_df[delta_df["cp"].eq("P")].copy()
+
+    call_25 = None
+    put_25 = None
+
+    if not calls_d.empty:
+        call_25 = calls_d.iloc[(calls_d["abs_delta"] - target_delta).abs().argsort()[:1]]
+
+    if not puts_d.empty:
+        put_25 = puts_d.iloc[(puts_d["abs_delta"] - target_delta).abs().argsort()[:1]]
+
+    call_iv = float(call_25["iv"].iloc[0]) if call_25 is not None and not call_25.empty else np.nan
+    put_iv = float(put_25["iv"].iloc[0]) if put_25 is not None and not put_25.empty else np.nan
+
+    risk_reversal = call_iv - put_iv if np.isfinite(call_iv) and np.isfinite(put_iv) else np.nan
+
+    cA, cB, cC, cD = st.columns(4)
+
+    cA.metric(
+        f"{target_delta:.2f}Δ Call IV",
+        f"{call_iv:.2%}" if np.isfinite(call_iv) else "N/A",
+    )
+
+    cB.metric(
+        f"{target_delta:.2f}Δ Put IV",
+        f"{put_iv:.2%}" if np.isfinite(put_iv) else "N/A",
+    )
+
+    cC.metric(
+        "Risk Reversal",
+        f"{risk_reversal:.2%}" if np.isfinite(risk_reversal) else "N/A",
+        help="Call IV minus Put IV at the selected target delta.",
+    )
+
+    if np.isfinite(risk_reversal):
+        if risk_reversal > 0:
+            rr_label = "Upside IV richer"
+        elif risk_reversal < 0:
+            rr_label = "Downside IV richer"
+        else:
+            rr_label = "Balanced"
+    else:
+        rr_label = "N/A"
+
+    cD.metric("Skew read", rr_label)
+
+    # ---------- Delta smile chart ----------
+    st.markdown("### IV by Signed Delta")
+
+    fig_delta_iv = px.scatter(
+        delta_df,
+        x="delta_signed",
+        y="iv",
+        color="cp",
+        size="volume",
+        hover_data={
+            "strike": ":,.2f",
+            "delta_signed": ":.3f",
+            "iv": ":.2%",
+            "oi": ":,.0f",
+            "volume": ":,.0f",
+            "cp": True,
+        },
+        template=PX_TEMPLATE,
+        title=f"IV Smile by Delta — {selected_symbol} {exp}",
+        color_discrete_sequence=["#1E90FF", "#FF4500"],
+    )
+
+    fig_delta_iv.add_vline(x=target_delta, line_dash="dot", line_color="gray")
+    fig_delta_iv.add_vline(x=-target_delta, line_dash="dot", line_color="gray")
+    fig_delta_iv.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.4)
+
+    fig_delta_iv.update_layout(
+        xaxis_title="Signed Delta",
+        yaxis_title="Implied Volatility",
+        hovermode="closest",
+        legend_title_text="Side",
+    )
+
+    st.plotly_chart(fig_delta_iv, use_container_width=True)
+
+    # ---------- Delta buckets ----------
+    def delta_bucket(x):
+        x = abs(float(x))
+
+        if x < 0.10:
+            return "Deep OTM / tail (<0.10Δ)"
+        elif x < 0.25:
+            return "OTM wing (0.10–0.25Δ)"
+        elif x < 0.40:
+            return "Near OTM (0.25–0.40Δ)"
+        elif x < 0.60:
+            return "ATM zone (0.40–0.60Δ)"
+        elif x < 0.80:
+            return "ITM zone (0.60–0.80Δ)"
+        else:
+            return "Deep ITM (>0.80Δ)"
+
+    delta_df["delta_bucket"] = delta_df["abs_delta"].apply(delta_bucket)
+
+    bucket_order = [
+        "Deep OTM / tail (<0.10Δ)",
+        "OTM wing (0.10–0.25Δ)",
+        "Near OTM (0.25–0.40Δ)",
+        "ATM zone (0.40–0.60Δ)",
+        "ITM zone (0.60–0.80Δ)",
+        "Deep ITM (>0.80Δ)",
+    ]
+
+    bucket_summary = (
+        delta_df.groupby(["delta_bucket", "cp"], as_index=False)
+        .agg(
+            oi=("oi", "sum"),
+            volume=("volume", "sum"),
+            avg_iv=("iv", "mean"),
+            contracts=("strike", "count"),
+        )
+    )
+
+    bucket_summary["delta_bucket"] = pd.Categorical(
+        bucket_summary["delta_bucket"],
+        categories=bucket_order,
+        ordered=True,
+    )
+
+    bucket_summary = bucket_summary.sort_values(["delta_bucket", "cp"])
+
+    st.markdown("### OI by Delta Bucket")
+
+    fig_oi_delta = px.bar(
+        bucket_summary,
+        x="delta_bucket",
+        y="oi",
+        color="cp",
+        barmode="group",
+        template=PX_TEMPLATE,
+        title=f"Open Interest by Delta Bucket — {selected_symbol} {exp}",
+        color_discrete_sequence=["#1E90FF", "#FF4500"],
+    )
+
+    fig_oi_delta.update_layout(
+        xaxis_title="Delta bucket",
+        yaxis_title="Open Interest",
+        hovermode="x unified",
+        legend_title_text="Side",
+    )
+
+    st.plotly_chart(fig_oi_delta, use_container_width=True)
+
+    st.markdown("### Volume by Delta Bucket")
+
+    fig_vol_delta = px.bar(
+        bucket_summary,
+        x="delta_bucket",
+        y="volume",
+        color="cp",
+        barmode="group",
+        template=PX_TEMPLATE,
+        title=f"Volume by Delta Bucket — {selected_symbol} {exp}",
+        color_discrete_sequence=["#1E90FF", "#FF4500"],
+    )
+
+    fig_vol_delta.update_layout(
+        xaxis_title="Delta bucket",
+        yaxis_title="Volume",
+        hovermode="x unified",
+        legend_title_text="Side",
+    )
+
+    st.plotly_chart(fig_vol_delta, use_container_width=True)
+
+    st.markdown("### Delta Bucket Summary")
+
+    st.dataframe(
+        bucket_summary.style.format({
+            "oi": "{:,.0f}",
+            "volume": "{:,.0f}",
+            "avg_iv": "{:.2%}",
+            "contracts": "{:,.0f}",
+        }),
+        use_container_width=True,
+        height=320,
+    )
+
+    if selected_symbol == "VIX":
+        st.info(
+            "For VIX, delta buckets describe sensitivity to the volatility index, "
+            "not to an equity-index price move. Interpret risk reversal and skew accordingly."
+        )
+
+# ---- Tab 2: IV Skew ----
+with tabs[2]:
     st.subheader("Volatility Skew")
     tab_help("""
 **What this shows**
@@ -941,8 +1230,8 @@ You can see **Calls vs Puts**, optional **smoothed lines** (LOWESS), and a **mid
 
 
 
-# ---- Tab 2: OI & Volume ----
-with tabs[2]:
+# ---- Tab 3: OI & Volume ----
+with tabs[3]:
     st.subheader("Open Interest & Volume")
     tab_help("""
 **What this shows**
@@ -1039,8 +1328,8 @@ Use this tab to quickly answer:
         st.plotly_chart(fig_vol, use_container_width=True)
 
 
-# ---- Tab 3: Gamma (approx) ----
-with tabs[3]:
+# ---- Tab 4: Gamma (approx) ----
+with tabs[4]:
     st.subheader("Dealer Gamma Exposure (approx)")
     tab_help("""
 **What this shows**
@@ -1389,8 +1678,8 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     cC.metric("Flow bias", bias)
 
 
-# ---- Tab 4: Term Structure ----
-with tabs[4]:
+# ---- Tab 5: Term Structure ----
+with tabs[5]:
     st.subheader("ATM IV Term Structure")
     tab_help("""
 **What this shows**
@@ -1518,8 +1807,8 @@ This is the **term structure of volatility**: how expensive options are by horiz
 
     st.plotly_chart(fig_t, use_container_width=True)
 
-# ---- Tab 5: Table ----
-with tabs[5]:
+# ---- Tab 6: Table ----
+with tabs[6]:
     st.subheader("Contracts")
     tab_help("""
 **What this shows**
@@ -1551,8 +1840,8 @@ This tab is your **X-ray** for the rest of the dashboard.
     cols = [c for c in cols if c in dfe.columns]
     st.dataframe(dfe[cols].sort_values(["cp", "strike"]), use_container_width=True, height=420)
 
-# ---- Tab 6: Skew Overlay (Multi-Expiry) ----
-with tabs[6]:
+# ---- Tab 7: Skew Overlay (Multi-Expiry) ----
+with tabs[7]:
     st.subheader("Multi-Expiry Skew Overlay (IV vs Strike or Moneyness)")
     tab_help("""
 **What this shows**
@@ -1683,8 +1972,8 @@ This tab is great for spotting **which expiries are “doing something different
     fig.update_layout(xaxis_title=x_title, yaxis_title="Implied Volatility", legend_title_text="Expiration", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-# ---- Tab 7: OI Change (Flows) ----
-with tabs[7]:
+# ---- Tab 8: OI Change (Flows) ----
+with tabs[8]:
     st.subheader("Open Interest Change (Day-over-Day)")
     tab_help("""
 **What this shows**
@@ -1836,8 +2125,8 @@ Think of this as your **flow radar**: “Where did the book meaningfully change 
     )
 
 
-# ---- Tab 8: Positioning Tilt ----
-with tabs[8]:
+# ---- Tab 9: Positioning Tilt ----
+with tabs[9]:
     st.subheader("Net Positioning Tilt (Call OI − Put OI)")
     tab_help("""
 **What this shows**
@@ -1879,8 +2168,8 @@ Use this tab for a quick visual answer to:
     st.plotly_chart(fig_tilt, use_container_width=True)
     st.dataframe(tilt.tail(100), use_container_width=True, height=320)
 
-# ---- Tab 9: Spread Detector ----
-with tabs[9]:
+# ---- Tab 10: Spread Detector ----
+with tabs[10]:
     st.subheader("Spread Detector (heuristic)")
     tab_help("""
 **What this shows**
@@ -1975,8 +2264,8 @@ Use this as a **starting point**:
                      use_container_width=True, height=320)
     st.caption("Heuristic detector — use as leads, not definitive classification.")
 
-# ---- Tab 10: Skew Today vs Yesterday ----
-with tabs[10]:
+# ---- Tab 11: Skew Today vs Yesterday ----
+with tabs[11]:
     st.subheader("Skew Overlay: Today vs Yesterday")
     tab_help("""
 **What this shows**
@@ -2077,8 +2366,8 @@ This tab answers:
     fig.update_layout(xaxis_title=x_title, yaxis_title="Implied Volatility", hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
 
-# ---- Tab 11: 3D Vol Surface ----
-with tabs[11]:
+# ---- Tab 12: 3D Vol Surface ----
+with tabs[12]:
     st.subheader("3D Volatility Surface (Moneyness × DTE × IV)")
     tab_help("""
 **What this shows**
@@ -2128,8 +2417,8 @@ Use this for an overall **gestalt**:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-# ---- Tab 12: Summary (Volume, OI, Gamma, GEX) ----
-with tabs[12]:
+# ---- Tab 13: Summary (Volume, OI, Gamma, GEX) ----
+with tabs[13]:
     st.subheader("Daily Summary by Expiration (Volume, OI, Gamma, GEX)")
     tab_help("""
 **What this shows**
@@ -2340,8 +2629,8 @@ Use this tab as your **dashboard of dashboards**:
 
     st.dataframe(summary_df, use_container_width=True, height=540)
 
-# ---- Tab 13: Help & How To Use ----
-with tabs[13]:
+# ---- Tab 14: Help & How To Use ----
+with tabs[14]:
     st.subheader(f"How to Use {selected_symbol} Terminal")
 
     st.markdown("""
@@ -2483,9 +2772,9 @@ If you hover around long enough, the charts will talk to you. 😄
     st.markdown("---")
     st.markdown("© 2024 Options Terminal. Built with ❤️ using Streamlit.")
 
-# ---- Tab 14: Probable Levels ---- 
+# ---- Tab 15: Probable Levels ---- 
 
-with tabs[14]:  # "Probable Levels"
+with tabs[15]:  # "Probable Levels"
     st.subheader(f"Most Probable {selected_symbol} Levels (from Options)")
 
     # 1) Pricing date (today vs chosen history snapshot)
