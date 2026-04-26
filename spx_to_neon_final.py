@@ -43,7 +43,6 @@ SOURCES = {
     },
 }
 
-
 INSERT_COLUMNS = [
     "symbol",
     "run_ts",
@@ -61,7 +60,6 @@ INSERT_COLUMNS = [
     "gamma",
     "option_net",
 ]
-
 
 SCHEMA_SQL = f"""
 CREATE TABLE IF NOT EXISTS {TABLE} (
@@ -83,7 +81,6 @@ CREATE TABLE IF NOT EXISTS {TABLE} (
     option_net NUMERIC
 );
 """
-
 
 UNIQUE_INDEX_SQL = f"""
 CREATE UNIQUE INDEX IF NOT EXISTS uq_options_chain_snapshot_contract
@@ -261,12 +258,160 @@ def parse_cboe_options(symbol, data, opra_regex):
             to_float(option.get("iv")),
             to_float(option.get("delta")),
             to_float(option.get("gamma")),
-            to_float(option.get("option_net")),
+            # Cboe currently appears to return this as missing/None for the endpoint,
+            # but the field is kept for schema compatibility.
+            to_float(
+                option.get("option_net")
+                or option.get("net")
+                or option.get("change")
+                or option.get("price_change")
+            ),
         ])
 
-    df = pd.DataFrame(rows, columns=INSERT_COLUMNS)
+    return pd.DataFrame(rows, columns=INSERT_COLUMNS)
 
-    return df
+
+# ============================================================
+# DATA QUALITY
+# ============================================================
+
+def validate_options_df(df: pd.DataFrame, symbol: str) -> None:
+    """
+    Basic ETL data-quality checks.
+    Raises errors for critical failures and prints warnings for non-critical issues.
+    """
+
+    required_cols = [
+        "symbol",
+        "run_ts",
+        "underlying_px",
+        "expiration_date",
+        "strike",
+        "cp",
+        "last",
+        "bid",
+        "ask",
+        "volume",
+        "oi",
+        "iv",
+        "delta",
+        "gamma",
+    ]
+
+    missing_cols = [col for col in required_cols if col not in df.columns]
+
+    if missing_cols:
+        raise ValueError(f"{symbol}: missing required columns: {missing_cols}")
+
+    if df.empty:
+        raise ValueError(f"{symbol}: parsed dataframe is empty.")
+
+    expected_min_rows = {
+        "SPX": 5_000,
+        "NDX": 2_000,
+        "VIX": 500,
+    }
+
+    min_rows = expected_min_rows.get(symbol, 100)
+
+    if len(df) < min_rows:
+        raise ValueError(
+            f"{symbol}: suspiciously few rows parsed. "
+            f"Expected at least {min_rows:,}, got {len(df):,}."
+        )
+
+    if df["underlying_px"].isna().all():
+        raise ValueError(f"{symbol}: underlying_px is completely missing.")
+
+    if df["delta"].isna().all():
+        raise ValueError(f"{symbol}: delta is completely missing.")
+
+    if df["gamma"].isna().all():
+        raise ValueError(f"{symbol}: gamma is completely missing.")
+
+    invalid_cp = set(df["cp"].dropna().unique()) - {"C", "P"}
+    if invalid_cp:
+        raise ValueError(f"{symbol}: invalid cp values found: {invalid_cp}")
+
+    duplicate_keys = df.duplicated(
+        subset=["symbol", "run_ts", "expiration_date", "strike", "cp"]
+    ).sum()
+
+    if duplicate_keys > 0:
+        raise ValueError(
+            f"{symbol}: found {duplicate_keys:,} duplicate contract keys before insert."
+        )
+
+    iv = pd.to_numeric(df["iv"], errors="coerce")
+    bad_iv_count = ((iv < 0) | (iv > 10)).sum()
+
+    if bad_iv_count > 0:
+        print(
+            f"⚠️ {symbol}: {bad_iv_count:,} rows have suspicious IV values outside [0, 10]."
+        )
+
+    zero_oi_share = (pd.to_numeric(df["oi"], errors="coerce").fillna(0) == 0).mean()
+
+    if zero_oi_share > 0.95:
+        print(
+            f"⚠️ {symbol}: more than 95% of rows have zero OI. "
+            "Check whether the source changed or data is stale."
+        )
+
+    print(f"✅ {symbol}: data-quality checks passed.")
+    
+def deduplicate_contract_rows(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Removes duplicate rows for the database uniqueness key:
+    symbol + run_ts + expiration_date + strike + cp
+
+    If Cboe returns multiple rows that collapse into the same key,
+    keep the row with the strongest data quality / liquidity.
+    """
+
+    if df.empty:
+        return df
+
+    key_cols = ["symbol", "run_ts", "expiration_date", "strike", "cp"]
+
+    duplicate_count = df.duplicated(subset=key_cols).sum()
+
+    if duplicate_count == 0:
+        return df
+
+    print(
+        f"⚠️ {symbol}: found {duplicate_count:,} duplicate contract rows. "
+        "Deduplicating before insert."
+    )
+
+    out = df.copy()
+
+    for col in ["volume", "oi", "bid", "ask", "last", "iv", "delta", "gamma"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # Higher score = better row to keep.
+    out["_quality_score"] = (
+        out["volume"].fillna(0) * 10
+        + out["oi"].fillna(0)
+        + out["bid"].fillna(0)
+        + out["ask"].fillna(0)
+        + out["last"].fillna(0)
+        + out["iv"].fillna(0)
+        + out["delta"].notna().astype(int)
+        + out["gamma"].notna().astype(int)
+    )
+
+    out = (
+        out.sort_values(key_cols + ["_quality_score"], ascending=[True, True, True, True, True, False])
+        .drop_duplicates(subset=key_cols, keep="first")
+        .drop(columns=["_quality_score"])
+        .reset_index(drop=True)
+    )
+
+    print(f"✅ {symbol}: rows after deduplication: {len(out):,}")
+
+    return out
 
 
 # ============================================================
@@ -281,7 +426,7 @@ def load_to_neon(df, symbol):
     with psycopg2.connect(NEON_URL) as conn:
         with conn.cursor() as cur:
             # Schema and indexes are managed manually in Neon.
-            # Do not create indexes here because the ETL user may not own the table.
+            # Do not create schema/indexes here because the ETL user may not own the table.
             # cur.execute(SCHEMA_SQL)
             # cur.execute(UNIQUE_INDEX_SQL)
 
@@ -310,12 +455,15 @@ def load_to_neon(df, symbol):
                     delta = EXCLUDED.delta,
                     gamma = EXCLUDED.gamma,
                     option_net = EXCLUDED.option_net;
-                            """
+            """
 
             execute_values(
                 cur,
                 insert_sql,
-                [tuple(row) for row in df[INSERT_COLUMNS].itertuples(index=False, name=None)],
+                [
+                    tuple(row)
+                    for row in df[INSERT_COLUMNS].itertuples(index=False, name=None)
+                ],
             )
 
     print(f"✅ Inserted/updated {len(df):,} rows for {symbol} into {TABLE}.")
@@ -334,11 +482,16 @@ def run_symbol(symbol):
     data = fetch_cboe_json(symbol, config)
     df = parse_cboe_options(symbol, data, config["opra_regex"])
 
-    print(f"{symbol} parsed rows: {len(df):,}")
+    print(f"{symbol} parsed rows before deduplication: {len(df):,}")
+
+    df = deduplicate_contract_rows(df, symbol)
+
+    print(f"{symbol} parsed rows after deduplication: {len(df):,}")
 
     if not df.empty:
         print(df.head())
 
+    validate_options_df(df, symbol)
     load_to_neon(df, symbol)
 
 
