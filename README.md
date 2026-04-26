@@ -18,6 +18,30 @@ It includes volatility skew, open interest, volume, gamma exposure, delta analyt
 
 ---
 
+## Screenshots
+
+### Dashboard Overview
+
+![Dashboard Overview](screenshots/01_dashboard_overview.png)
+
+### Gamma Exposure
+
+![Gamma Exposure](screenshots/02_gamma_exposure.png)
+
+### Delta Analytics
+
+![Delta Analytics](screenshots/03_delta_analytics.png)
+
+### Multi-Expiry Skew Overlay
+
+![Multi-Expiry Skew Overlay](screenshots/04_skew_overlay.png)
+
+### VIX Probable Levels
+
+![VIX Probable Levels](screenshots/05_vix_probable_levels.png)
+
+---
+
 ## Main Features
 
 ### Multi-Symbol Options Dashboard
@@ -207,6 +231,8 @@ The ETL uses:
 SYMBOLS_TO_RUN = ["SPX", "NDX", "VIX"]
 ```
 
+The ETL also includes data-quality checks and deduplication before inserting into the database.
+
 ---
 
 ## GitHub Actions Automation
@@ -237,6 +263,13 @@ Add this repository secret:
 
 ```text
 NEON_URL
+```
+
+or map your existing secret name to the environment variable:
+
+```yaml
+env:
+  NEON_URL: ${{ secrets.N_URL }}
 ```
 
 Example format:
@@ -335,6 +368,13 @@ Options-Chain-Analytics/
 ├── spx_to_neon_final.py
 ├── requirements.txt
 ├── README.md
+│
+├── screenshots/
+│   ├── 01_dashboard_overview.png
+│   ├── 02_gamma_exposure.png
+│   ├── 03_delta_analytics.png
+│   ├── 04_skew_overlay.png
+│   └── 05_vix_probable_levels.png
 │
 └── .github/
     └── workflows/
