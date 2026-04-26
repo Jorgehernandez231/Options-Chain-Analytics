@@ -442,18 +442,36 @@ for c in ["strike", "last", "bid", "ask", "iv", "volume", "oi", "underlying_px",
     if c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# ---- Better SPOT detection from the options chain (ATM strike proxy) ----
+# ---- Better SPOT detection ----
+# Prefer the real underlying price from the data source.
+# Fallback to highest-volume strike, then median strike.
 
-if "volume" in df.columns and df["volume"].notna().any():
-    try:
-        # ATM = strike of highest volume option
-        atm_strike = float(df.loc[df["volume"].idxmax(), "strike"])
-    except Exception:
-        atm_strike = float(df["strike"].median(skipna=True))
-else:
-    atm_strike = float(df["strike"].median(skipna=True))
+def infer_default_spot(df: pd.DataFrame) -> float:
+    if df.empty:
+        return 0.0
 
-default_spot = atm_strike
+    if "underlying_px" in df.columns:
+        underlying = pd.to_numeric(df["underlying_px"], errors="coerce").dropna()
+        underlying = underlying[underlying > 0]
+
+        if not underlying.empty:
+            return float(underlying.median())
+
+    if "volume" in df.columns and df["volume"].notna().any():
+        try:
+            return float(df.loc[df["volume"].idxmax(), "strike"])
+        except Exception:
+            pass
+
+    return float(df["strike"].median(skipna=True))
+
+
+default_spot = infer_default_spot(df)
+
+spot_source = "underlying_px" if (
+    "underlying_px" in df.columns
+    and pd.to_numeric(df["underlying_px"], errors="coerce").dropna().gt(0).any()
+) else "ATM/high-volume strike fallback"
 # ---------- Top controls ----------
 c1,c2,c3,c4,c5 = st.columns([1,1,1,1,3])
 
@@ -468,6 +486,7 @@ r_default    = _safe_default(URL_DEFAULTS.get("r"), 0.03)
 
 with c1:
     spot = st.number_input("Spot (S)", value=spot_default, step=1.0, format="%.2f")
+    st.caption(f"Default source: {spot_source}")
 with c2:
     r = st.number_input("Risk-free (r)", value=r_default, step=0.005, format="%.4f")
 
