@@ -15,15 +15,60 @@ from plotly.subplots import make_subplots
 
 
 
-# ---------- Page / Theme ----------
+# ---------- Config ----------
 PX_TEMPLATE = "plotly_dark"
-st.set_page_config(page_title="SPX Terminal", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("<style>div.block-container{padding-top:1.0rem;padding-bottom:0.5rem;}</style>", unsafe_allow_html=True)
-st.title("SPX Terminal • Options")
+OPTIONS_TABLE = "options_chain"
 
-# ---------- DB ----------
-TABLE_LATEST = "spx_chain"       # latest snapshot table (normalized rows: cp in separate rows)
-TABLE_HIST   = "spx_chain"  # historical snapshots with run_date
+UNDERLYINGS = {
+    "SPX": {
+        "label": "S&P 500 Index Options",
+        "table_symbol": "SPX",
+        "contract_multiplier": 100.0,
+        "asset_class": "equity_index",
+    },
+    "NDX": {
+        "label": "Nasdaq-100 Index Options",
+        "table_symbol": "NDX",
+        "contract_multiplier": 100.0,
+        "asset_class": "equity_index",
+    },
+    "VIX": {
+        "label": "Cboe Volatility Index Options",
+        "table_symbol": "VIX",
+        "contract_multiplier": 100.0,
+        "asset_class": "volatility_index",
+    },
+}
+
+# ---------- Page / Theme ----------
+st.set_page_config(page_title="Options Terminal", layout="wide", initial_sidebar_state="collapsed")
+st.markdown("<style>div.block-container{padding-top:1.0rem;padding-bottom:0.5rem;}</style>", unsafe_allow_html=True)
+
+# ---------- Underlying selector ----------
+with st.sidebar:
+    st.subheader("Underlying")
+
+    selected_symbol = st.selectbox(
+        "Select product",
+        list(UNDERLYINGS.keys()),
+        index=0,
+        format_func=lambda x: f"{x} — {UNDERLYINGS[x]['label']}",
+    )
+
+symbol_config = UNDERLYINGS[selected_symbol]
+symbol = symbol_config["table_symbol"]
+CONTRACT_MULT = symbol_config["contract_multiplier"]
+
+# ---------- Page title ----------
+st.title(f"{selected_symbol} Terminal • Options")
+st.caption(symbol_config["label"])
+
+if selected_symbol == "VIX":
+    st.info(
+        "VIX options are volatility-index options. Interpret gamma, probable levels, "
+        "and skew differently from SPX/NDX equity-index options."
+    )
+
 # ---------- DB using SQLAlchemy ----------
 
 @st.cache_resource
@@ -107,16 +152,26 @@ URL_DEFAULTS = get_url_state()
 
 # ---------- History helpers ----------
 @st.cache_data(ttl=180, show_spinner=False)
-def load_run_dates():
+def load_run_dates(symbol):
     """
-    Return list of distinct run timestamps (run_ts) as Python datetime objects,
+    Return list of distinct run timestamps (run_ts) for one symbol,
     newest first.
     """
     try:
-        df = q(f"SELECT DISTINCT run_ts FROM {TABLE_HIST} ORDER BY run_ts DESC")
-        return list(df["run_ts"])
+        df = q(
+            f"""
+            SELECT DISTINCT run_ts
+            FROM {OPTIONS_TABLE}
+            WHERE symbol = %s
+              AND run_ts IS NOT NULL
+            ORDER BY run_ts DESC
+            """,
+            (symbol,),
+        )
+        return list(pd.to_datetime(df["run_ts"])) if not df.empty else []
     except Exception:
         return []
+
 
 def prev_run_date(dates, cur_dt):
     if not dates or cur_dt not in dates:
@@ -124,10 +179,13 @@ def prev_run_date(dates, cur_dt):
     idx = dates.index(cur_dt)
     return dates[idx + 1] if idx + 1 < len(dates) else None
 
+
 @st.cache_data(ttl=180, show_spinner=False)
-def load_chain_by_run(run_ts):
-    return q(f"""
+def load_chain_by_run(symbol, run_ts):
+    return q(
+        f"""
         SELECT run_ts,
+               symbol,
                underlying_px,
                expiration_date,
                strike,
@@ -138,16 +196,48 @@ def load_chain_by_run(run_ts):
                volume,
                oi,
                iv
-        FROM {TABLE_HIST}
-        WHERE run_ts = %s
+        FROM {OPTIONS_TABLE}
+        WHERE symbol = %s
+          AND run_ts = %s
         ORDER BY expiration_date, strike, cp
-    """, (run_ts,))
+        """,
+        (symbol, run_ts),
+    )
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def load_latest(symbol):
+    return q(
+        f"""
+        SELECT run_ts,
+               symbol,
+               underlying_px,
+               expiration_date,
+               strike,
+               cp,
+               last,
+               bid,
+               ask,
+               volume,
+               oi,
+               iv
+        FROM {OPTIONS_TABLE}
+        WHERE symbol = %s
+          AND run_ts = (
+              SELECT MAX(run_ts)
+              FROM {OPTIONS_TABLE}
+              WHERE symbol = %s
+          )
+        ORDER BY expiration_date, strike, cp
+        """,
+        (symbol, symbol),
+    )
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def load_chain_two_days(run_date_cur, run_date_prev):
-    cur = load_chain_by_run(run_date_cur)
-    prv = load_chain_by_run(run_date_prev) if run_date_prev else pd.DataFrame(columns=cur.columns)
+def load_chain_two_days(symbol, run_date_cur, run_date_prev):
+    cur = load_chain_by_run(symbol, run_date_cur)
+    prv = load_chain_by_run(symbol, run_date_prev) if run_date_prev else pd.DataFrame(columns=cur.columns)
     return cur, prv
 
 # ---------- Math ----------
@@ -294,9 +384,10 @@ def robust_zscore(series: pd.Series) -> pd.Series:
     return (x - med) / (1.4826 * mad)
 
 # ---------- Load initial data ----------
-dates = load_run_dates()
+dates = load_run_dates(symbol)
 
 with st.sidebar:
+    st.markdown("---")
     st.subheader("History")
 
     use_hist = st.checkbox(
@@ -320,33 +411,19 @@ with st.sidebar:
             "Run timestamp (UTC)",
             dates,
             index=default_idx,
-            key="run_ts",
+            key=f"run_ts_{selected_symbol}",
             format_func=lambda x: x.strftime("%Y-%m-%d %H:%M:%S"),
         )
     else:
-        st.caption("No history snapshots found in table spx_chain_raw_hist.")
+        st.caption(f"No history snapshots found for {selected_symbol}.")
         chosen_date = None
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def load_latest():
-    return q(f"""
-        SELECT run_ts,
-               underlying_px,
-               expiration_date,
-               strike,
-               cp,
-               last,
-               bid,
-               ask,
-               volume,
-               oi,
-               iv
-        FROM {TABLE_LATEST}
-    """)
-
-
-df = load_chain_by_run(chosen_date) if (use_hist and chosen_date) else load_latest()
+df = (
+    load_chain_by_run(symbol, chosen_date)
+    if (use_hist and chosen_date)
+    else load_latest(symbol)
+)
 if df.empty:
     st.warning("No rows returned. Check tables/permissions.")
     st.stop()
@@ -758,7 +835,7 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
 """)
 
 
-    CONTRACT_MULT = 100.0
+    CONTRACT_MULT = symbol_config["contract_multiplier"]
     today = date.today()
 
     # --- Controls for style/zoom ---
@@ -820,12 +897,12 @@ The idea: this is a map of where dealers (in aggregate) are **long or short gamm
     
         # ---- OI Change overlay (same expiry, prev vs current run) ----
     if overlay_oi:
-        all_dates = load_run_dates()
+        all_dates = load_run_dates(symbol)
         date_cur = chosen_date if (use_hist and chosen_date) else (all_dates[0] if all_dates else None)
         date_prev = prev_run_date(all_dates, date_cur) if all_dates else None
 
         if date_cur is not None and date_prev is not None:
-            cur_run, prv_run = load_chain_two_days(date_cur, date_prev)
+            cur_run, prv_run = load_chain_two_days(symbol, date_cur, date_prev)
 
             cur_run["expiration_date"] = pd.to_datetime(cur_run["expiration_date"]).dt.date
             prv_run["expiration_date"] = pd.to_datetime(prv_run["expiration_date"]).dt.date
@@ -1376,7 +1453,7 @@ The **change in Open Interest** by strike and side between two snapshots (today 
 Think of this as your **flow radar**: “Where did the book meaningfully change since last time?”
 """)
 
-    all_dates = load_run_dates()
+    all_dates = load_run_dates(symbol)
     if not all_dates:
         st.info("History table not available.")
         st.stop()
@@ -1385,7 +1462,7 @@ Think of this as your **flow radar**: “Where did the book meaningfully change 
     date_cur = chosen_date if (use_hist and chosen_date) else all_dates[0]
     date_prev = prev_run_date(all_dates, date_cur)
 
-    cur, prv = load_chain_two_days(date_cur, date_prev)
+    cur, prv = load_chain_two_days(symbol, date_cur, date_prev)
     if cur.empty:
         st.info("No rows for selected date.")
         st.stop()
@@ -1568,13 +1645,13 @@ Use this as a **starting point**:
 - Identify interesting candidates here, then inspect them more closely in the **OI Change** and **Contracts** tabs to understand intent and pricing.
 """)
 
-    all_dates = load_run_dates()
+    all_dates = load_run_dates(symbol)
     if not all_dates:
         st.info("History table not available."); st.stop()
     date_cur = chosen_date if (use_hist and chosen_date) else all_dates[0]
     date_prev = prev_run_date(all_dates, date_cur)
 
-    cur, prv = load_chain_two_days(date_cur, date_prev)
+    cur, prv = load_chain_two_days(symbol, date_cur, date_prev)
     if cur.empty:
         st.info("No rows for selected date."); st.stop()
 
@@ -1661,7 +1738,7 @@ This tab answers:
 > “**What changed in skew** between yesterday and today for this expiration?”
 """)
 
-    all_dates = load_run_dates()
+    all_dates = load_run_dates(symbol)
     if not all_dates or len(all_dates) < 2:
         st.info("Need at least two run dates in history to compare."); st.stop()
 
@@ -1670,7 +1747,7 @@ This tab answers:
     if not date_prev:
         st.info("No previous run found to compare."); st.stop()
 
-    cur, prv = load_chain_two_days(date_cur, date_prev)
+    cur, prv = load_chain_two_days(symbol, date_cur, date_prev)
     if cur.empty or prv.empty:
         st.info("No data for selected comparison dates."); st.stop()
 
@@ -1813,44 +1890,44 @@ Use this tab as your **dashboard of dashboards**:
 > it tells you how the overall options landscape is **drifting over time**, not just in a single snapshot.
 """)
 
-    all_dates = load_run_dates()
+    all_dates = load_run_dates(symbol)
     if not all_dates:
         st.info("History table not available.")
         st.stop()
 
     col1, col2 = st.columns([1, 1])
 
-with col1:
-    max_n = len(all_dates)
+    with col1:
+        max_n = len(all_dates)
 
-    # Safe slider bounds
-    min_v = 1
-    max_v = max_n
-    default_v = min(25, max_v)
+        # Safe slider bounds
+        min_v = 1
+        max_v = max_n
+        default_v = min(25, max_v)
 
-    n_rows = st.slider(
-        "Number of snapshots (most recent)",
-        min_value=min_v,
-        max_value=max_v,
-        value=default_v,
-        step=1,
-        key="summary_n",
-    )
+        n_rows = st.slider(
+            "Number of snapshots (most recent)",
+            min_value=min_v,
+            max_value=max_v,
+            value=default_v,
+            step=1,
+            key="summary_n",
+        )
 
-with col2:
-    exp_mode = st.selectbox(
-        "Expiration mode",
-        ["All expirations", "Front expiration only"],
-        key="summary_exp_mode",
-    )
+    with col2:
+        exp_mode = st.selectbox(
+            "Expiration mode",
+            ["All expirations", "Front expiration only"],
+            key="summary_exp_mode",
+        )
 
-    scale_millions = st.checkbox(
-        "Show values in millions",
-        value=True,
-        key="summary_scale_mio",
-    )
+        scale_millions = st.checkbox(
+            "Show values in millions",
+            value=True,
+            key="summary_scale_mio",
+        )
 
-    CONTRACT_MULT = 100.0
+    CONTRACT_MULT = symbol_config["contract_multiplier"]
     r_used = r
     spot_used = float(spot)
 
@@ -1859,7 +1936,7 @@ with col2:
     selected_dates = all_dates[:n_rows]
 
     for run_ts in selected_dates:
-        df_run = load_chain_by_run(run_ts).copy()
+        df_run = load_chain_by_run(symbol, run_ts).copy()
         if df_run.empty:
             continue
 
@@ -1987,7 +2064,7 @@ with col2:
 
 # ---- Tab 13: Help & How To Use ----
 with tabs[12]:
-    st.subheader("How to Use SPX Terminal")
+    st.subheader(f"How to Use {selected_symbol} Terminal")
 
     st.markdown("""
 This dashboard is designed to explore **SPX options positioning, volatility and flows**.
@@ -2126,12 +2203,12 @@ This dashboard is designed to explore **SPX options positioning, volatility and 
 If you hover around long enough, the charts will talk to you. 😄
 """)
     st.markdown("---")
-    st.markdown("© 2024 SPX Terminal. Built with ❤️ using Streamlit.")
+    st.markdown("© 2024 Options Terminal. Built with ❤️ using Streamlit.")
 
 # ---- Tab 14: Probable Levels ---- 
 
 with tabs[13]:  # "Probable Levels"
-    st.subheader("Most Probable SPX Levels (from Options)")
+    st.subheader(f"Most Probable {selected_symbol} Levels (from Options)")
 
     # 1) Pricing date (today vs chosen history snapshot)
     if use_hist and (chosen_date is not None):
@@ -2172,7 +2249,7 @@ with tabs[13]:  # "Probable Levels"
     # 6) Headline metrics
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("Current SPX (S₀)", f"{ranges['S0']:,.1f}")
+        st.metric(f"Current {selected_symbol} (S₀)", f"{ranges['S0']:,.1f}")
     with col2:
         st.metric("ATM IV", f"{ranges['atm_iv']:.2%}")
     with col3:
