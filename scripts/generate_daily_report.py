@@ -22,7 +22,7 @@ EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 EMAIL_TO = os.getenv("EMAIL_TO")
 
-TABLE_NAME = os.getenv("OPTIONS_TABLE")
+TABLE_NAME = (os.getenv("OPTIONS_TABLE") or "options_chain").strip()
 
 OPTIONS_SYMBOLS = os.getenv("OPTIONS_SYMBOLS", "SPX,NDX,VIX")
 SYMBOLS = [s.strip().upper() for s in OPTIONS_SYMBOLS.split(",") if s.strip()]
@@ -91,6 +91,63 @@ def load_latest_snapshot_for_symbol(engine, symbol):
     return df, latest_run
 
 
+def load_previous_snapshot_for_symbol(engine, symbol, latest_run):
+    query_previous_run = text(f"""
+        SELECT MAX(run_ts) AS previous_run
+        FROM {TABLE_NAME}
+        WHERE symbol = :symbol
+          AND run_ts < :latest_run
+    """)
+
+    previous_run = pd.read_sql(
+        query_previous_run,
+        engine,
+        params={
+            "symbol": symbol,
+            "latest_run": latest_run
+        }
+    )["previous_run"].iloc[0]
+
+    if pd.isna(previous_run):
+        print(f"[WARNING] No previous run_ts found for {symbol}. Daily comparison unavailable.")
+        return pd.DataFrame(), None
+
+    query_data = text(f"""
+        SELECT 
+            id,
+            symbol,
+            run_ts,
+            underlying_px,
+            expiration_date,
+            strike,
+            cp,
+            last,
+            bid,
+            ask,
+            volume,
+            oi,
+            iv,
+            delta,
+            gamma,
+            option_net
+        FROM {TABLE_NAME}
+        WHERE run_ts = :previous_run
+          AND symbol = :symbol
+        ORDER BY expiration_date, strike, cp
+    """)
+
+    df_prev = pd.read_sql(
+        query_data,
+        engine,
+        params={
+            "previous_run": previous_run,
+            "symbol": symbol
+        }
+    )
+
+    return df_prev, previous_run
+
+
 # =========================
 # CALC HELPERS
 # =========================
@@ -126,7 +183,6 @@ def calculate_atm_iv(df, spot):
         return None
 
     tmp["distance_to_spot"] = (tmp["strike"] - spot).abs()
-
     atm_rows = tmp.sort_values("distance_to_spot").head(10)
 
     if atm_rows.empty:
@@ -152,7 +208,6 @@ def calculate_gamma_exposure(df):
         return None, None, None
 
     tmp["gamma_exposure"] = tmp["gamma"] * tmp["oi"] * 100 * (spot ** 2) * 0.01
-
     tmp.loc[tmp["cp"] == "P", "gamma_exposure"] *= -1
 
     gex_by_strike = (
@@ -187,8 +242,6 @@ def calculate_expected_move(df, spot, atm_iv):
     Simple expected move approximation using nearest expiration:
 
     1σ move = spot * ATM IV * sqrt(days_to_exp / 365)
-
-    This is useful for daily report levels.
     """
     if spot is None or atm_iv is None:
         return None, None, None, None
@@ -296,6 +349,49 @@ def calculate_metrics_for_symbol(df, latest_run, symbol):
     return metrics
 
 
+def calculate_metric_change(current, previous, key):
+    current_value = current.get(key)
+    previous_value = previous.get(key)
+
+    if current_value is None or previous_value is None:
+        return None
+
+    if pd.isna(current_value) or pd.isna(previous_value):
+        return None
+
+    return current_value - previous_value
+
+
+def enrich_metrics_with_previous(current_metrics, previous_metrics):
+    if previous_metrics is None:
+        current_metrics["has_previous"] = False
+        return current_metrics
+
+    current_metrics["has_previous"] = True
+    current_metrics["previous_run"] = previous_metrics.get("latest_run")
+
+    comparison_keys = [
+        "spot",
+        "atm_iv",
+        "call_volume",
+        "put_volume",
+        "put_call_volume_ratio",
+        "call_oi",
+        "put_oi",
+        "put_call_oi_ratio",
+        "total_gex",
+    ]
+
+    for key in comparison_keys:
+        current_metrics[f"{key}_change"] = calculate_metric_change(
+            current_metrics,
+            previous_metrics,
+            key
+        )
+
+    return current_metrics
+
+
 def collect_all_metrics(engine, symbols):
     all_metrics = []
 
@@ -307,8 +403,34 @@ def collect_all_metrics(engine, symbols):
         if df.empty or latest_run is None:
             continue
 
-        metrics = calculate_metrics_for_symbol(df, latest_run, symbol)
-        all_metrics.append(metrics)
+        current_metrics = calculate_metrics_for_symbol(df, latest_run, symbol)
+
+        print(f"Loading previous snapshot for {symbol}...")
+
+        df_prev, previous_run = load_previous_snapshot_for_symbol(
+            engine,
+            symbol,
+            latest_run
+        )
+
+        if df_prev.empty or previous_run is None:
+            current_metrics = enrich_metrics_with_previous(
+                current_metrics,
+                previous_metrics=None
+            )
+        else:
+            previous_metrics = calculate_metrics_for_symbol(
+                df_prev,
+                previous_run,
+                symbol
+            )
+
+            current_metrics = enrich_metrics_with_previous(
+                current_metrics,
+                previous_metrics
+            )
+
+        all_metrics.append(current_metrics)
 
         print(f"{symbol}: {len(df)} rows analysed. Latest run_ts: {latest_run}")
 
@@ -368,6 +490,54 @@ def fmt_datetime(value):
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def fmt_change(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:,.0f}"
+
+
+def fmt_price_change(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:,.2f}"
+
+
+def fmt_decimal_change(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.2f}"
+
+
+def fmt_percent_point_change(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value * 100:.2f} pp"
+
+
+def fmt_gex_change(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+
+    sign = "+" if value > 0 else ""
+
+    abs_value = abs(value)
+
+    if abs_value >= 1_000_000_000:
+        return f"{sign}{value / 1_000_000_000:.2f}B"
+    if abs_value >= 1_000_000:
+        return f"{sign}{value / 1_000_000:.2f}M"
+
+    return f"{sign}{value:,.0f}"
+
+
 # =========================
 # INTERPRETATION
 # =========================
@@ -418,6 +588,41 @@ def build_interpretation(metrics):
                 "directional sensitivity and potentially larger intraday moves."
             )
 
+    if metrics.get("has_previous"):
+        spot_change = metrics.get("spot_change")
+        atm_iv_change = metrics.get("atm_iv_change")
+        total_gex_change = metrics.get("total_gex_change")
+
+        if spot_change is not None and not pd.isna(spot_change):
+            if spot_change > 0:
+                comments.append(
+                    f"The underlying price increased by {fmt_price_change(spot_change)} versus the previous snapshot."
+                )
+            elif spot_change < 0:
+                comments.append(
+                    f"The underlying price decreased by {fmt_price_change(spot_change)} versus the previous snapshot."
+                )
+
+        if atm_iv_change is not None and not pd.isna(atm_iv_change):
+            if atm_iv_change > 0:
+                comments.append(
+                    f"ATM IV increased by {fmt_percent_point_change(atm_iv_change)}, suggesting higher implied uncertainty."
+                )
+            elif atm_iv_change < 0:
+                comments.append(
+                    f"ATM IV decreased by {fmt_percent_point_change(atm_iv_change)}, suggesting lower implied uncertainty."
+                )
+
+        if total_gex_change is not None and not pd.isna(total_gex_change):
+            if total_gex_change > 0:
+                comments.append(
+                    f"Net GEX increased by {fmt_gex_change(total_gex_change)}, pointing to stronger positive gamma positioning."
+                )
+            elif total_gex_change < 0:
+                comments.append(
+                    f"Net GEX decreased by {fmt_gex_change(total_gex_change)}, pointing to weaker or more negative gamma positioning."
+                )
+
     if not comments:
         return "No interpretation available due to missing metrics."
 
@@ -464,8 +669,68 @@ def build_summary_table(all_metrics):
     """
 
 
+def build_daily_change_section(metrics):
+    if not metrics.get("has_previous"):
+        return """
+        <h3>Daily Change</h3>
+        <p>No previous snapshot available for comparison.</p>
+        """
+
+    return f"""
+    <h3>Daily Change vs Previous Snapshot</h3>
+
+    <p>
+        <strong>Previous snapshot:</strong> {fmt_datetime(metrics.get("previous_run"))}
+    </p>
+
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
+        <tr style="background-color: #f2f2f2;">
+            <th>Metric</th>
+            <th>Change</th>
+        </tr>
+        <tr>
+            <td>Underlying Price</td>
+            <td>{fmt_price_change(metrics.get("spot_change"))}</td>
+        </tr>
+        <tr>
+            <td>ATM IV</td>
+            <td>{fmt_percent_point_change(metrics.get("atm_iv_change"))}</td>
+        </tr>
+        <tr>
+            <td>Call Volume</td>
+            <td>{fmt_change(metrics.get("call_volume_change"))}</td>
+        </tr>
+        <tr>
+            <td>Put Volume</td>
+            <td>{fmt_change(metrics.get("put_volume_change"))}</td>
+        </tr>
+        <tr>
+            <td>Put/Call Volume Ratio</td>
+            <td>{fmt_decimal_change(metrics.get("put_call_volume_ratio_change"))}</td>
+        </tr>
+        <tr>
+            <td>Call Open Interest</td>
+            <td>{fmt_change(metrics.get("call_oi_change"))}</td>
+        </tr>
+        <tr>
+            <td>Put Open Interest</td>
+            <td>{fmt_change(metrics.get("put_oi_change"))}</td>
+        </tr>
+        <tr>
+            <td>Put/Call OI Ratio</td>
+            <td>{fmt_decimal_change(metrics.get("put_call_oi_ratio_change"))}</td>
+        </tr>
+        <tr>
+            <td>Net Gamma Exposure</td>
+            <td>{fmt_gex_change(metrics.get("total_gex_change"))}</td>
+        </tr>
+    </table>
+    """
+
+
 def build_symbol_section(metrics):
     interpretation = build_interpretation(metrics)
+    daily_change_section = build_daily_change_section(metrics)
 
     return f"""
     <hr style="margin-top: 30px; margin-bottom: 30px;">
@@ -480,6 +745,8 @@ def build_symbol_section(metrics):
         <strong>Expirations analysed:</strong> {metrics["num_expirations"]}<br>
         <strong>Expiration range:</strong> {metrics["first_expiration"]} to {metrics["last_expiration"]}
     </p>
+
+    {daily_change_section}
 
     <h3>Expected Move</h3>
 
@@ -655,9 +922,13 @@ def send_email(subject, html_body):
 # =========================
 
 def main():
+    if not TABLE_NAME:
+        raise ValueError("OPTIONS_TABLE is empty. Set it to 'options_chain'.")
+
     if not SYMBOLS:
         raise ValueError("No symbols configured. Set OPTIONS_SYMBOLS, for example: SPX,NDX,VIX")
 
+    print(f"Using table: {TABLE_NAME}")
     print(f"Configured symbols: {SYMBOLS}")
 
     engine = get_engine()
