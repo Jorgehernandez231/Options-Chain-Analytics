@@ -1,0 +1,37 @@
+name: Daily Options Report
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "30 23 * * 1-5"
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Generate and send daily options report
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NEON_URL: ${{ secrets.NEON_URL }}
+          N_URL: ${{ secrets.N_URL }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          OPTIONS_TABLE: ${{ secrets.OPTIONS_TABLE }}
+          OPTIONS_SYMBOLS: ${{ secrets.OPTIONS_SYMBOLS }}
+        run: python scripts/generate_daily_report.py
