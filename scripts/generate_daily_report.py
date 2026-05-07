@@ -239,7 +239,7 @@ def calculate_gamma_exposure(df):
 
 def calculate_expected_move(df, spot, atm_iv):
     """
-    Simple expected move approximation using nearest expiration:
+    Simple expected move approximation using nearest expiration.
 
     1σ move = spot * ATM IV * sqrt(days_to_exp / 365)
     """
@@ -262,6 +262,41 @@ def calculate_expected_move(df, spot, atm_iv):
     one_sigma_high = spot + one_sigma_move
 
     return days_to_exp, one_sigma_move, one_sigma_low, one_sigma_high
+
+
+def get_top_strikes(df, cp_value, metric, top_n=5):
+    """
+    Returns top strikes for a given option side and metric.
+
+    cp_value:
+        C = Calls
+        P = Puts
+
+    metric:
+        volume
+        oi
+    """
+    tmp = df[df["cp"] == cp_value].copy()
+
+    if tmp.empty or metric not in tmp.columns:
+        return []
+
+    grouped = (
+        tmp.groupby("strike", as_index=False)[metric]
+        .sum()
+        .sort_values(metric, ascending=False)
+        .head(top_n)
+    )
+
+    results = []
+
+    for _, row in grouped.iterrows():
+        results.append({
+            "strike": row["strike"],
+            "value": row[metric]
+        })
+
+    return results
 
 
 # =========================
@@ -314,6 +349,11 @@ def calculate_metrics_for_symbol(df, latest_run, symbol):
 
     total_gex, max_positive_gex_strike, max_negative_gex_strike = calculate_gamma_exposure(df)
 
+    top_call_oi = get_top_strikes(df, "C", "oi", top_n=5)
+    top_put_oi = get_top_strikes(df, "P", "oi", top_n=5)
+    top_call_volume = get_top_strikes(df, "C", "volume", top_n=5)
+    top_put_volume = get_top_strikes(df, "P", "volume", top_n=5)
+
     metrics = {
         "symbol": symbol,
         "latest_run": latest_run,
@@ -344,6 +384,10 @@ def calculate_metrics_for_symbol(df, latest_run, symbol):
         "total_gex": total_gex,
         "max_positive_gex_strike": max_positive_gex_strike,
         "max_negative_gex_strike": max_negative_gex_strike,
+        "top_call_oi": top_call_oi,
+        "top_put_oi": top_put_oi,
+        "top_call_volume": top_call_volume,
+        "top_put_volume": top_put_volume,
     }
 
     return metrics
@@ -728,9 +772,65 @@ def build_daily_change_section(metrics):
     """
 
 
+def build_top_strikes_table(title, rows):
+    if not rows:
+        return f"""
+        <h4>{title}</h4>
+        <p>No data available.</p>
+        """
+
+    html_rows = ""
+
+    for item in rows:
+        html_rows += f"""
+        <tr>
+            <td>{fmt_number(item.get("strike"))}</td>
+            <td>{fmt_number(item.get("value"))}</td>
+        </tr>
+        """
+
+    return f"""
+    <h4>{title}</h4>
+
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; margin-bottom: 16px;">
+        <tr style="background-color: #f2f2f2;">
+            <th>Strike</th>
+            <th>Value</th>
+        </tr>
+        {html_rows}
+    </table>
+    """
+
+
+def build_top_strikes_section(metrics):
+    return f"""
+    <h3>Top 5 Strikes</h3>
+
+    <table width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+            <td valign="top" width="50%">
+                {build_top_strikes_table("Top 5 Call OI", metrics.get("top_call_oi"))}
+            </td>
+            <td valign="top" width="50%">
+                {build_top_strikes_table("Top 5 Put OI", metrics.get("top_put_oi"))}
+            </td>
+        </tr>
+        <tr>
+            <td valign="top" width="50%">
+                {build_top_strikes_table("Top 5 Call Volume", metrics.get("top_call_volume"))}
+            </td>
+            <td valign="top" width="50%">
+                {build_top_strikes_table("Top 5 Put Volume", metrics.get("top_put_volume"))}
+            </td>
+        </tr>
+    </table>
+    """
+
+
 def build_symbol_section(metrics):
     interpretation = build_interpretation(metrics)
     daily_change_section = build_daily_change_section(metrics)
+    top_strikes_section = build_top_strikes_section(metrics)
 
     return f"""
     <hr style="margin-top: 30px; margin-bottom: 30px;">
@@ -831,6 +931,8 @@ def build_symbol_section(metrics):
             <td>{fmt_number(metrics["max_put_oi"])}</td>
         </tr>
     </table>
+
+    {top_strikes_section}
 
     <h3>Gamma Exposure Approximation</h3>
 
