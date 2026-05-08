@@ -27,6 +27,8 @@ TABLE_NAME = (os.getenv("OPTIONS_TABLE") or "options_chain").strip()
 OPTIONS_SYMBOLS = os.getenv("OPTIONS_SYMBOLS", "SPX,NDX,VIX")
 SYMBOLS = [s.strip().upper() for s in OPTIONS_SYMBOLS.split(",") if s.strip()]
 
+CONTRACT_MULTIPLIER = 100
+
 
 # =========================
 # DATABASE
@@ -149,8 +151,29 @@ def load_previous_snapshot_for_symbol(engine, symbol, latest_run):
 
 
 # =========================
-# CALC HELPERS
+# BASIC HELPERS
 # =========================
+
+def normalize_dataframe(df):
+    df = df.copy()
+
+    numeric_cols = [
+        "underlying_px", "strike", "last", "bid", "ask",
+        "volume", "oi", "iv", "delta", "gamma", "option_net"
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["volume"] = df["volume"].fillna(0)
+    df["oi"] = df["oi"].fillna(0)
+    df["gamma"] = df["gamma"].fillna(0)
+
+    df["cp"] = df["cp"].astype(str).str.upper().str.strip()
+
+    return df
+
 
 def safe_divide(a, b):
     if b == 0 or pd.isna(b):
@@ -170,6 +193,20 @@ def get_underlying_price(df):
         return float(px.iloc[0])
     return None
 
+
+def days_to_expiration(expiration_date):
+    if expiration_date is None or pd.isna(expiration_date):
+        return None
+
+    exp_date = pd.to_datetime(expiration_date).date()
+    today = datetime.utcnow().date()
+
+    return max((exp_date - today).days, 1)
+
+
+# =========================
+# IV / EXPECTED MOVE
+# =========================
 
 def calculate_atm_iv(df, spot):
     if spot is None:
@@ -191,33 +228,138 @@ def calculate_atm_iv(df, spot):
     return float(atm_rows["iv"].mean())
 
 
-def calculate_gamma_exposure(df):
+def calculate_atm_iv_for_expiration(df, spot, expiration_date):
+    if spot is None:
+        return None
+
+    tmp = df[df["expiration_date"] == expiration_date].copy()
+    tmp = tmp[tmp["iv"].notna()]
+    tmp = tmp[tmp["iv"] > 0]
+
+    if tmp.empty:
+        return None
+
+    tmp["distance_to_spot"] = (tmp["strike"] - spot).abs()
+    atm_rows = tmp.sort_values("distance_to_spot").head(6)
+
+    if atm_rows.empty:
+        return None
+
+    return float(atm_rows["iv"].mean())
+
+
+def calculate_expected_move_for_expiration(spot, atm_iv, expiration_date):
+    if spot is None or atm_iv is None:
+        return None, None, None, None
+
+    dte = days_to_expiration(expiration_date)
+
+    if dte is None:
+        return None, None, None, None
+
+    one_sigma_move = spot * atm_iv * ((dte / 365) ** 0.5)
+
+    one_sigma_low = spot - one_sigma_move
+    one_sigma_high = spot + one_sigma_move
+
+    return dte, one_sigma_move, one_sigma_low, one_sigma_high
+
+
+def calculate_expected_move(df, spot, atm_iv):
+    if spot is None or atm_iv is None:
+        return None, None, None, None
+
+    expirations = sorted(df["expiration_date"].dropna().unique())
+
+    if not expirations:
+        return None, None, None, None
+
+    nearest_exp = expirations[0]
+
+    return calculate_expected_move_for_expiration(
+        spot=spot,
+        atm_iv=atm_iv,
+        expiration_date=nearest_exp
+    )
+
+
+def calculate_term_structure(df, spot, max_expirations=8):
+    expirations = sorted(df["expiration_date"].dropna().unique())
+
+    rows = []
+
+    for exp in expirations[:max_expirations]:
+        atm_iv = calculate_atm_iv_for_expiration(df, spot, exp)
+        dte, move, low, high = calculate_expected_move_for_expiration(
+            spot=spot,
+            atm_iv=atm_iv,
+            expiration_date=exp
+        )
+
+        exp_df = df[df["expiration_date"] == exp]
+        call_volume = exp_df[exp_df["cp"] == "C"]["volume"].sum()
+        put_volume = exp_df[exp_df["cp"] == "P"]["volume"].sum()
+        call_oi = exp_df[exp_df["cp"] == "C"]["oi"].sum()
+        put_oi = exp_df[exp_df["cp"] == "P"]["oi"].sum()
+
+        rows.append({
+            "expiration_date": exp,
+            "days_to_exp": dte,
+            "atm_iv": atm_iv,
+            "expected_move": move,
+            "one_sigma_low": low,
+            "one_sigma_high": high,
+            "put_call_volume_ratio": safe_divide(put_volume, call_volume),
+            "put_call_oi_ratio": safe_divide(put_oi, call_oi),
+        })
+
+    return rows
+
+
+# =========================
+# GAMMA
+# =========================
+
+def calculate_gamma_profile(df):
     """
     Approximate gamma exposure.
 
-    Formula:
     GEX ≈ gamma * OI * 100 * S² * 0.01
 
     Puts are treated as negative gamma contribution for positioning view.
     """
     tmp = df.copy()
-
     spot = get_underlying_price(tmp)
 
     if spot is None:
-        return None, None, None
+        return {
+            "total_gex": None,
+            "max_positive_gex_strike": None,
+            "max_negative_gex_strike": None,
+            "gamma_flip": None,
+            "distance_to_gamma_flip": None,
+            "gex_by_strike": pd.DataFrame(),
+        }
 
-    tmp["gamma_exposure"] = tmp["gamma"] * tmp["oi"] * 100 * (spot ** 2) * 0.01
+    tmp["gamma_exposure"] = tmp["gamma"] * tmp["oi"] * CONTRACT_MULTIPLIER * (spot ** 2) * 0.01
     tmp.loc[tmp["cp"] == "P", "gamma_exposure"] *= -1
 
     gex_by_strike = (
         tmp.groupby("strike", as_index=False)["gamma_exposure"]
         .sum()
         .sort_values("strike")
+        .reset_index(drop=True)
     )
 
     if gex_by_strike.empty:
-        return None, None, None
+        return {
+            "total_gex": None,
+            "max_positive_gex_strike": None,
+            "max_negative_gex_strike": None,
+            "gamma_flip": None,
+            "distance_to_gamma_flip": None,
+            "gex_by_strike": gex_by_strike,
+        }
 
     total_gex = gex_by_strike["gamma_exposure"].sum()
 
@@ -234,48 +376,52 @@ def calculate_gamma_exposure(df):
     max_positive_gex_strike = get_value(max_positive_gex_row, "strike")
     max_negative_gex_strike = get_value(max_negative_gex_row, "strike")
 
-    return total_gex, max_positive_gex_strike, max_negative_gex_strike
+    gex_by_strike["cumulative_gex"] = gex_by_strike["gamma_exposure"].cumsum()
+
+    gamma_flip = None
+
+    for i in range(1, len(gex_by_strike)):
+        prev_gex = gex_by_strike.loc[i - 1, "cumulative_gex"]
+        curr_gex = gex_by_strike.loc[i, "cumulative_gex"]
+
+        if prev_gex == 0:
+            gamma_flip = float(gex_by_strike.loc[i - 1, "strike"])
+            break
+
+        if (prev_gex < 0 and curr_gex > 0) or (prev_gex > 0 and curr_gex < 0):
+            prev_strike = float(gex_by_strike.loc[i - 1, "strike"])
+            curr_strike = float(gex_by_strike.loc[i, "strike"])
+
+            denominator = abs(prev_gex) + abs(curr_gex)
+
+            if denominator == 0:
+                gamma_flip = curr_strike
+            else:
+                weight = abs(prev_gex) / denominator
+                gamma_flip = prev_strike + weight * (curr_strike - prev_strike)
+
+            break
+
+    distance_to_gamma_flip = None
+
+    if gamma_flip is not None and spot is not None:
+        distance_to_gamma_flip = spot - gamma_flip
+
+    return {
+        "total_gex": total_gex,
+        "max_positive_gex_strike": max_positive_gex_strike,
+        "max_negative_gex_strike": max_negative_gex_strike,
+        "gamma_flip": gamma_flip,
+        "distance_to_gamma_flip": distance_to_gamma_flip,
+        "gex_by_strike": gex_by_strike,
+    }
 
 
-def calculate_expected_move(df, spot, atm_iv):
-    """
-    Simple expected move approximation using nearest expiration.
-
-    1σ move = spot * ATM IV * sqrt(days_to_exp / 365)
-    """
-    if spot is None or atm_iv is None:
-        return None, None, None, None
-
-    expirations = sorted(df["expiration_date"].dropna().unique())
-
-    if not expirations:
-        return None, None, None, None
-
-    nearest_exp = pd.to_datetime(expirations[0]).date()
-    today = datetime.utcnow().date()
-
-    days_to_exp = max((nearest_exp - today).days, 1)
-
-    one_sigma_move = spot * atm_iv * ((days_to_exp / 365) ** 0.5)
-
-    one_sigma_low = spot - one_sigma_move
-    one_sigma_high = spot + one_sigma_move
-
-    return days_to_exp, one_sigma_move, one_sigma_low, one_sigma_high
-
+# =========================
+# TOP STRIKES / OI CHANGE
+# =========================
 
 def get_top_strikes(df, cp_value, metric, top_n=5):
-    """
-    Returns top strikes for a given option side and metric.
-
-    cp_value:
-        C = Calls
-        P = Puts
-
-    metric:
-        volume
-        oi
-    """
     tmp = df[df["cp"] == cp_value].copy()
 
     if tmp.empty or metric not in tmp.columns:
@@ -288,15 +434,83 @@ def get_top_strikes(df, cp_value, metric, top_n=5):
         .head(top_n)
     )
 
-    results = []
-
-    for _, row in grouped.iterrows():
-        results.append({
+    return [
+        {
             "strike": row["strike"],
             "value": row[metric]
-        })
+        }
+        for _, row in grouped.iterrows()
+    ]
 
-    return results
+
+def calculate_oi_change_by_strike(current_df, previous_df, cp_value, top_n=5):
+    current = current_df[current_df["cp"] == cp_value].copy()
+    previous = previous_df[previous_df["cp"] == cp_value].copy()
+
+    if current.empty or previous.empty:
+        return {
+            "top_increases": [],
+            "top_decreases": []
+        }
+
+    current_oi = (
+        current.groupby("strike", as_index=False)["oi"]
+        .sum()
+        .rename(columns={"oi": "current_oi"})
+    )
+
+    previous_oi = (
+        previous.groupby("strike", as_index=False)["oi"]
+        .sum()
+        .rename(columns={"oi": "previous_oi"})
+    )
+
+    merged = current_oi.merge(
+        previous_oi,
+        on="strike",
+        how="outer"
+    )
+
+    merged["current_oi"] = merged["current_oi"].fillna(0)
+    merged["previous_oi"] = merged["previous_oi"].fillna(0)
+    merged["oi_change"] = merged["current_oi"] - merged["previous_oi"]
+
+    increases = (
+        merged[merged["oi_change"] > 0]
+        .sort_values("oi_change", ascending=False)
+        .head(top_n)
+    )
+
+    decreases = (
+        merged[merged["oi_change"] < 0]
+        .sort_values("oi_change", ascending=True)
+        .head(top_n)
+    )
+
+    top_increases = [
+        {
+            "strike": row["strike"],
+            "change": row["oi_change"],
+            "current_oi": row["current_oi"],
+            "previous_oi": row["previous_oi"],
+        }
+        for _, row in increases.iterrows()
+    ]
+
+    top_decreases = [
+        {
+            "strike": row["strike"],
+            "change": row["oi_change"],
+            "current_oi": row["current_oi"],
+            "previous_oi": row["previous_oi"],
+        }
+        for _, row in decreases.iterrows()
+    ]
+
+    return {
+        "top_increases": top_increases,
+        "top_decreases": top_decreases
+    }
 
 
 # =========================
@@ -304,19 +518,7 @@ def get_top_strikes(df, cp_value, metric, top_n=5):
 # =========================
 
 def calculate_metrics_for_symbol(df, latest_run, symbol):
-    df = df.copy()
-
-    numeric_cols = [
-        "underlying_px", "strike", "last", "bid", "ask",
-        "volume", "oi", "iv", "delta", "gamma", "option_net"
-    ]
-
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["volume"] = df["volume"].fillna(0)
-    df["oi"] = df["oi"].fillna(0)
-    df["gamma"] = df["gamma"].fillna(0)
+    df = normalize_dataframe(df)
 
     calls = df[df["cp"] == "C"]
     puts = df[df["cp"] == "P"]
@@ -347,12 +549,14 @@ def calculate_metrics_for_symbol(df, latest_run, symbol):
 
     expirations = sorted(df["expiration_date"].dropna().unique())
 
-    total_gex, max_positive_gex_strike, max_negative_gex_strike = calculate_gamma_exposure(df)
+    gamma_profile = calculate_gamma_profile(df)
 
     top_call_oi = get_top_strikes(df, "C", "oi", top_n=5)
     top_put_oi = get_top_strikes(df, "P", "oi", top_n=5)
     top_call_volume = get_top_strikes(df, "C", "volume", top_n=5)
     top_put_volume = get_top_strikes(df, "P", "volume", top_n=5)
+
+    term_structure = calculate_term_structure(df, spot, max_expirations=8)
 
     metrics = {
         "symbol": symbol,
@@ -381,13 +585,16 @@ def calculate_metrics_for_symbol(df, latest_run, symbol):
         "max_call_oi": get_value(max_call_oi_row, "oi"),
         "max_put_oi_strike": get_value(max_put_oi_row, "strike"),
         "max_put_oi": get_value(max_put_oi_row, "oi"),
-        "total_gex": total_gex,
-        "max_positive_gex_strike": max_positive_gex_strike,
-        "max_negative_gex_strike": max_negative_gex_strike,
+        "total_gex": gamma_profile["total_gex"],
+        "max_positive_gex_strike": gamma_profile["max_positive_gex_strike"],
+        "max_negative_gex_strike": gamma_profile["max_negative_gex_strike"],
+        "gamma_flip": gamma_profile["gamma_flip"],
+        "distance_to_gamma_flip": gamma_profile["distance_to_gamma_flip"],
         "top_call_oi": top_call_oi,
         "top_put_oi": top_put_oi,
         "top_call_volume": top_call_volume,
         "top_put_volume": top_put_volume,
+        "term_structure": term_structure,
     }
 
     return metrics
@@ -424,6 +631,8 @@ def enrich_metrics_with_previous(current_metrics, previous_metrics):
         "put_oi",
         "put_call_oi_ratio",
         "total_gex",
+        "gamma_flip",
+        "distance_to_gamma_flip",
     ]
 
     for key in comparison_keys:
@@ -432,6 +641,37 @@ def enrich_metrics_with_previous(current_metrics, previous_metrics):
             previous_metrics,
             key
         )
+
+    return current_metrics
+
+
+def enrich_metrics_with_oi_change(current_metrics, current_df, previous_df):
+    if previous_df is None or previous_df.empty:
+        current_metrics["has_oi_change"] = False
+        return current_metrics
+
+    current_df = normalize_dataframe(current_df)
+    previous_df = normalize_dataframe(previous_df)
+
+    call_oi_change = calculate_oi_change_by_strike(
+        current_df=current_df,
+        previous_df=previous_df,
+        cp_value="C",
+        top_n=5
+    )
+
+    put_oi_change = calculate_oi_change_by_strike(
+        current_df=current_df,
+        previous_df=previous_df,
+        cp_value="P",
+        top_n=5
+    )
+
+    current_metrics["has_oi_change"] = True
+    current_metrics["call_oi_top_increases"] = call_oi_change["top_increases"]
+    current_metrics["call_oi_top_decreases"] = call_oi_change["top_decreases"]
+    current_metrics["put_oi_top_increases"] = put_oi_change["top_increases"]
+    current_metrics["put_oi_top_decreases"] = put_oi_change["top_decreases"]
 
     return current_metrics
 
@@ -462,6 +702,12 @@ def collect_all_metrics(engine, symbols):
                 current_metrics,
                 previous_metrics=None
             )
+
+            current_metrics = enrich_metrics_with_oi_change(
+                current_metrics,
+                current_df=df,
+                previous_df=None
+            )
         else:
             previous_metrics = calculate_metrics_for_symbol(
                 df_prev,
@@ -472,6 +718,12 @@ def collect_all_metrics(engine, symbols):
             current_metrics = enrich_metrics_with_previous(
                 current_metrics,
                 previous_metrics
+            )
+
+            current_metrics = enrich_metrics_with_oi_change(
+                current_metrics,
+                current_df=df,
+                previous_df=df_prev
             )
 
         all_metrics.append(current_metrics)
@@ -537,7 +789,6 @@ def fmt_datetime(value):
 def fmt_change(value):
     if value is None or pd.isna(value):
         return "N/A"
-
     sign = "+" if value > 0 else ""
     return f"{sign}{value:,.0f}"
 
@@ -545,7 +796,6 @@ def fmt_change(value):
 def fmt_price_change(value):
     if value is None or pd.isna(value):
         return "N/A"
-
     sign = "+" if value > 0 else ""
     return f"{sign}{value:,.2f}"
 
@@ -553,7 +803,6 @@ def fmt_price_change(value):
 def fmt_decimal_change(value):
     if value is None or pd.isna(value):
         return "N/A"
-
     sign = "+" if value > 0 else ""
     return f"{sign}{value:.2f}"
 
@@ -561,7 +810,6 @@ def fmt_decimal_change(value):
 def fmt_percent_point_change(value):
     if value is None or pd.isna(value):
         return "N/A"
-
     sign = "+" if value > 0 else ""
     return f"{sign}{value * 100:.2f} pp"
 
@@ -571,7 +819,6 @@ def fmt_gex_change(value):
         return "N/A"
 
     sign = "+" if value > 0 else ""
-
     abs_value = abs(value)
 
     if abs_value >= 1_000_000_000:
@@ -580,6 +827,171 @@ def fmt_gex_change(value):
         return f"{sign}{value / 1_000_000:.2f}M"
 
     return f"{sign}{value:,.0f}"
+
+
+def fmt_date(value):
+    if value is None or pd.isna(value):
+        return "N/A"
+    return str(pd.to_datetime(value).date())
+
+
+# =========================
+# EXECUTIVE SUMMARY / ALERTS
+# =========================
+
+def classify_market_regime(metrics):
+    total_gex = metrics.get("total_gex")
+    atm_iv_change = metrics.get("atm_iv_change")
+    pc_volume = metrics.get("put_call_volume_ratio")
+
+    if total_gex is not None and total_gex > 0:
+        gamma_regime = "positive gamma"
+    elif total_gex is not None and total_gex < 0:
+        gamma_regime = "negative gamma"
+    else:
+        gamma_regime = "unclear gamma"
+
+    if atm_iv_change is not None and not pd.isna(atm_iv_change):
+        if atm_iv_change > 0.01:
+            vol_regime = "volatility expansion"
+        elif atm_iv_change < -0.01:
+            vol_regime = "volatility compression"
+        else:
+            vol_regime = "stable implied volatility"
+    else:
+        vol_regime = "volatility trend unavailable"
+
+    if pc_volume is not None:
+        if pc_volume > 1.3:
+            flow_regime = "put-heavy flow"
+        elif pc_volume < 0.75:
+            flow_regime = "call-heavy flow"
+        else:
+            flow_regime = "balanced flow"
+    else:
+        flow_regime = "flow unavailable"
+
+    return f"{gamma_regime}, {vol_regime}, {flow_regime}"
+
+
+def generate_symbol_alerts(metrics):
+    alerts = []
+    symbol = metrics["symbol"]
+
+    pc_volume = metrics.get("put_call_volume_ratio")
+    pc_oi = metrics.get("put_call_oi_ratio")
+    atm_iv_change = metrics.get("atm_iv_change")
+    total_gex = metrics.get("total_gex")
+    total_gex_change = metrics.get("total_gex_change")
+    gamma_flip = metrics.get("gamma_flip")
+    distance_to_gamma_flip = metrics.get("distance_to_gamma_flip")
+    spot = metrics.get("spot")
+
+    if pc_volume is not None and pc_volume >= 1.5:
+        alerts.append(f"{symbol}: Put/Call Volume Ratio is elevated at {fmt_decimal(pc_volume)}.")
+
+    if pc_volume is not None and pc_volume <= 0.6:
+        alerts.append(f"{symbol}: Call volume strongly dominates, with Put/Call Volume Ratio at {fmt_decimal(pc_volume)}.")
+
+    if pc_oi is not None and pc_oi >= 1.5:
+        alerts.append(f"{symbol}: Put open interest is meaningfully higher than call open interest. Put/Call OI Ratio: {fmt_decimal(pc_oi)}.")
+
+    if atm_iv_change is not None and not pd.isna(atm_iv_change):
+        if atm_iv_change >= 0.02:
+            alerts.append(f"{symbol}: ATM IV increased by {fmt_percent_point_change(atm_iv_change)}.")
+        elif atm_iv_change <= -0.02:
+            alerts.append(f"{symbol}: ATM IV decreased by {fmt_percent_point_change(atm_iv_change)}.")
+
+    if total_gex is not None and total_gex < 0:
+        alerts.append(f"{symbol}: Net GEX is negative at {fmt_gex(total_gex)}.")
+
+    if total_gex_change is not None and not pd.isna(total_gex_change):
+        if abs(total_gex_change) >= 1_000_000_000:
+            alerts.append(f"{symbol}: Net GEX changed significantly by {fmt_gex_change(total_gex_change)}.")
+
+    if gamma_flip is not None and distance_to_gamma_flip is not None and spot is not None:
+        distance_pct = abs(distance_to_gamma_flip) / spot
+
+        if distance_pct <= 0.005:
+            alerts.append(
+                f"{symbol}: Price is close to gamma flip. Spot {fmt_price(spot)}, gamma flip {fmt_price(gamma_flip)}."
+            )
+
+    if metrics.get("has_oi_change"):
+        call_inc = metrics.get("call_oi_top_increases") or []
+        put_inc = metrics.get("put_oi_top_increases") or []
+
+        if call_inc:
+            top_call = call_inc[0]
+            if abs(top_call.get("change", 0)) >= 10_000:
+                alerts.append(
+                    f"{symbol}: Large Call OI increase at strike {fmt_number(top_call.get('strike'))}: "
+                    f"{fmt_change(top_call.get('change'))} contracts."
+                )
+
+        if put_inc:
+            top_put = put_inc[0]
+            if abs(top_put.get("change", 0)) >= 10_000:
+                alerts.append(
+                    f"{symbol}: Large Put OI increase at strike {fmt_number(top_put.get('strike'))}: "
+                    f"{fmt_change(top_put.get('change'))} contracts."
+                )
+
+    return alerts
+
+
+def generate_all_alerts(all_metrics):
+    alerts = []
+
+    for metrics in all_metrics:
+        alerts.extend(generate_symbol_alerts(metrics))
+
+    if not alerts:
+        alerts.append("No major alerts triggered based on the current rule set.")
+
+    return alerts
+
+
+def build_symbol_summary_sentence(metrics):
+    symbol = metrics["symbol"]
+    spot = metrics.get("spot")
+    atm_iv = metrics.get("atm_iv")
+    total_gex = metrics.get("total_gex")
+    gamma_flip = metrics.get("gamma_flip")
+    pc_volume = metrics.get("put_call_volume_ratio")
+    regime = classify_market_regime(metrics)
+
+    sentence = (
+        f"{symbol}: spot {fmt_price(spot)}, ATM IV {fmt_percent(atm_iv)}, "
+        f"Put/Call Volume Ratio {fmt_decimal(pc_volume)}, Net GEX {fmt_gex(total_gex)}, "
+        f"Gamma Flip {fmt_price(gamma_flip)}. Regime: {regime}."
+    )
+
+    return sentence
+
+
+def build_executive_summary(all_metrics):
+    sentences = [build_symbol_summary_sentence(m) for m in all_metrics]
+    alerts = generate_all_alerts(all_metrics)
+
+    priority_alerts = alerts[:5]
+
+    alert_html = "".join([f"<li>{alert}</li>" for alert in priority_alerts])
+    summary_html = "".join([f"<li>{sentence}</li>" for sentence in sentences])
+
+    return f"""
+    <h2>Executive Summary</h2>
+
+    <ul>
+        {summary_html}
+    </ul>
+
+    <h3>Top Alerts</h3>
+
+    <ul>
+        {alert_html}
+    </ul>
+    """
 
 
 # =========================
@@ -593,6 +1005,10 @@ def build_interpretation(metrics):
     pc_volume = metrics["put_call_volume_ratio"]
     pc_oi = metrics["put_call_oi_ratio"]
     total_gex = metrics["total_gex"]
+    gamma_flip = metrics.get("gamma_flip")
+    distance_to_gamma_flip = metrics.get("distance_to_gamma_flip")
+
+    comments.append(f"Market regime: {classify_market_regime(metrics)}.")
 
     if pc_volume is not None:
         if pc_volume > 1.2:
@@ -612,13 +1028,9 @@ def build_interpretation(metrics):
 
     if pc_oi is not None:
         if pc_oi > 1:
-            comments.append(
-                "Total put open interest is higher than call open interest."
-            )
+            comments.append("Total put open interest is higher than call open interest.")
         else:
-            comments.append(
-                "Total call open interest is higher than put open interest."
-            )
+            comments.append("Total call open interest is higher than put open interest.")
 
     if total_gex is not None:
         if total_gex > 0:
@@ -632,10 +1044,24 @@ def build_interpretation(metrics):
                 "directional sensitivity and potentially larger intraday moves."
             )
 
+    if gamma_flip is not None:
+        if distance_to_gamma_flip is not None:
+            if distance_to_gamma_flip > 0:
+                comments.append(
+                    f"Spot is above the estimated gamma flip by {fmt_price(distance_to_gamma_flip)} points."
+                )
+            elif distance_to_gamma_flip < 0:
+                comments.append(
+                    f"Spot is below the estimated gamma flip by {fmt_price(abs(distance_to_gamma_flip))} points."
+                )
+            else:
+                comments.append("Spot is currently at the estimated gamma flip level.")
+
     if metrics.get("has_previous"):
         spot_change = metrics.get("spot_change")
         atm_iv_change = metrics.get("atm_iv_change")
         total_gex_change = metrics.get("total_gex_change")
+        gamma_flip_change = metrics.get("gamma_flip_change")
 
         if spot_change is not None and not pd.isna(spot_change):
             if spot_change > 0:
@@ -667,6 +1093,31 @@ def build_interpretation(metrics):
                     f"Net GEX decreased by {fmt_gex_change(total_gex_change)}, pointing to weaker or more negative gamma positioning."
                 )
 
+        if gamma_flip_change is not None and not pd.isna(gamma_flip_change):
+            comments.append(
+                f"The estimated gamma flip changed by {fmt_price_change(gamma_flip_change)} points."
+            )
+
+    if metrics.get("has_oi_change"):
+        call_increases = metrics.get("call_oi_top_increases") or []
+        put_increases = metrics.get("put_oi_top_increases") or []
+
+        if call_increases:
+            top_call = call_increases[0]
+            comments.append(
+                f"The largest new call OI increase appeared around strike "
+                f"{fmt_number(top_call.get('strike'))}, with "
+                f"{fmt_change(top_call.get('change'))} contracts."
+            )
+
+        if put_increases:
+            top_put = put_increases[0]
+            comments.append(
+                f"The largest new put OI increase appeared around strike "
+                f"{fmt_number(top_put.get('strike'))}, with "
+                f"{fmt_change(top_put.get('change'))} contracts."
+            )
+
     if not comments:
         return "No interpretation available due to missing metrics."
 
@@ -674,7 +1125,7 @@ def build_interpretation(metrics):
 
 
 # =========================
-# HTML REPORT
+# HTML REPORT SECTIONS
 # =========================
 
 def build_summary_table(all_metrics):
@@ -689,6 +1140,8 @@ def build_summary_table(all_metrics):
             <td>{fmt_decimal(m["put_call_volume_ratio"])}</td>
             <td>{fmt_decimal(m["put_call_oi_ratio"])}</td>
             <td>{fmt_gex(m["total_gex"])}</td>
+            <td>{fmt_price(m["gamma_flip"])}</td>
+            <td>{fmt_price_change(m.get("distance_to_gamma_flip"))}</td>
             <td>{fmt_number(m["max_call_oi_strike"])}</td>
             <td>{fmt_number(m["max_put_oi_strike"])}</td>
         </tr>
@@ -705,11 +1158,25 @@ def build_summary_table(all_metrics):
             <th>Put/Call Vol</th>
             <th>Put/Call OI</th>
             <th>Net GEX</th>
+            <th>Gamma Flip</th>
+            <th>Distance to Flip</th>
             <th>Max Call OI Strike</th>
             <th>Max Put OI Strike</th>
         </tr>
         {rows}
     </table>
+    """
+
+
+def build_alerts_section(all_metrics):
+    alerts = generate_all_alerts(all_metrics)
+    rows = "".join([f"<li>{alert}</li>" for alert in alerts])
+
+    return f"""
+    <h2>Alerts</h2>
+    <ul>
+        {rows}
+    </ul>
     """
 
 
@@ -768,6 +1235,50 @@ def build_daily_change_section(metrics):
             <td>Net Gamma Exposure</td>
             <td>{fmt_gex_change(metrics.get("total_gex_change"))}</td>
         </tr>
+        <tr>
+            <td>Gamma Flip</td>
+            <td>{fmt_price_change(metrics.get("gamma_flip_change"))}</td>
+        </tr>
+    </table>
+    """
+
+
+def build_term_structure_section(metrics):
+    rows = ""
+
+    for item in metrics.get("term_structure", []):
+        rows += f"""
+        <tr>
+            <td>{fmt_date(item.get("expiration_date"))}</td>
+            <td>{fmt_number(item.get("days_to_exp"))}</td>
+            <td>{fmt_percent(item.get("atm_iv"))}</td>
+            <td>±{fmt_price(item.get("expected_move"))}</td>
+            <td>{fmt_price(item.get("one_sigma_low"))} – {fmt_price(item.get("one_sigma_high"))}</td>
+            <td>{fmt_decimal(item.get("put_call_volume_ratio"))}</td>
+            <td>{fmt_decimal(item.get("put_call_oi_ratio"))}</td>
+        </tr>
+        """
+
+    if not rows:
+        return """
+        <h3>Term Structure</h3>
+        <p>No term structure data available.</p>
+        """
+
+    return f"""
+    <h3>Term Structure</h3>
+
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
+        <tr style="background-color: #f2f2f2;">
+            <th>Expiration</th>
+            <th>DTE</th>
+            <th>ATM IV</th>
+            <th>1σ Move</th>
+            <th>1σ Range</th>
+            <th>Put/Call Vol</th>
+            <th>Put/Call OI</th>
+        </tr>
+        {rows}
     </table>
     """
 
@@ -827,10 +1338,77 @@ def build_top_strikes_section(metrics):
     """
 
 
+def build_oi_change_table(title, rows):
+    if not rows:
+        return f"""
+        <h4>{title}</h4>
+        <p>No relevant OI change detected.</p>
+        """
+
+    html_rows = ""
+
+    for item in rows:
+        html_rows += f"""
+        <tr>
+            <td>{fmt_number(item.get("strike"))}</td>
+            <td>{fmt_change(item.get("change"))}</td>
+            <td>{fmt_number(item.get("previous_oi"))}</td>
+            <td>{fmt_number(item.get("current_oi"))}</td>
+        </tr>
+        """
+
+    return f"""
+    <h4>{title}</h4>
+
+    <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; margin-bottom: 16px;">
+        <tr style="background-color: #f2f2f2;">
+            <th>Strike</th>
+            <th>OI Change</th>
+            <th>Previous OI</th>
+            <th>Current OI</th>
+        </tr>
+        {html_rows}
+    </table>
+    """
+
+
+def build_oi_change_section(metrics):
+    if not metrics.get("has_oi_change"):
+        return """
+        <h3>OI Change by Strike</h3>
+        <p>No previous snapshot available for OI change analysis.</p>
+        """
+
+    return f"""
+    <h3>OI Change by Strike</h3>
+
+    <table width="100%" cellpadding="0" cellspacing="0">
+        <tr>
+            <td valign="top" width="50%">
+                {build_oi_change_table("Top Call OI Increases", metrics.get("call_oi_top_increases"))}
+            </td>
+            <td valign="top" width="50%">
+                {build_oi_change_table("Top Put OI Increases", metrics.get("put_oi_top_increases"))}
+            </td>
+        </tr>
+        <tr>
+            <td valign="top" width="50%">
+                {build_oi_change_table("Top Call OI Decreases", metrics.get("call_oi_top_decreases"))}
+            </td>
+            <td valign="top" width="50%">
+                {build_oi_change_table("Top Put OI Decreases", metrics.get("put_oi_top_decreases"))}
+            </td>
+        </tr>
+    </table>
+    """
+
+
 def build_symbol_section(metrics):
     interpretation = build_interpretation(metrics)
     daily_change_section = build_daily_change_section(metrics)
+    term_structure_section = build_term_structure_section(metrics)
     top_strikes_section = build_top_strikes_section(metrics)
+    oi_change_section = build_oi_change_section(metrics)
 
     return f"""
     <hr style="margin-top: 30px; margin-bottom: 30px;">
@@ -868,6 +1446,8 @@ def build_symbol_section(metrics):
             <td>{fmt_price(metrics["one_sigma_low"])} – {fmt_price(metrics["one_sigma_high"])}</td>
         </tr>
     </table>
+
+    {term_structure_section}
 
     <h3>Market Positioning</h3>
 
@@ -934,6 +1514,8 @@ def build_symbol_section(metrics):
 
     {top_strikes_section}
 
+    {oi_change_section}
+
     <h3>Gamma Exposure Approximation</h3>
 
     <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
@@ -944,6 +1526,14 @@ def build_symbol_section(metrics):
         <tr>
             <td>Net Gamma Exposure</td>
             <td>{fmt_gex(metrics["total_gex"])}</td>
+        </tr>
+        <tr>
+            <td>Gamma Flip Level</td>
+            <td>{fmt_price(metrics["gamma_flip"])}</td>
+        </tr>
+        <tr>
+            <td>Distance to Gamma Flip</td>
+            <td>{fmt_price_change(metrics["distance_to_gamma_flip"])}</td>
         </tr>
         <tr>
             <td>Highest Positive GEX Strike</td>
@@ -972,17 +1562,30 @@ def build_html_report(all_metrics):
     html = f"""
     <html>
     <body style="font-family: Arial, sans-serif; color: #222; line-height: 1.5;">
-        <h1>Daily Options Report — {today}</h1>
+        <h1>Daily Options Intelligence Report — {today}</h1>
 
         <p>
             Symbols analysed: <strong>{", ".join([m["symbol"] for m in all_metrics])}</strong>
         </p>
 
+        {build_executive_summary(all_metrics)}
+
         {build_summary_table(all_metrics)}
+
+        {build_alerts_section(all_metrics)}
 
         {sections}
 
         <hr style="margin-top: 30px;">
+
+        <h3>Methodology Notes</h3>
+
+        <p style="font-size: 12px; color: #666;">
+            Gamma Exposure is an approximation based on available option gamma, open interest, contract multiplier and underlying price.
+            Puts are treated as negative gamma contribution for positioning analysis.
+            Gamma Flip is estimated from the cumulative gamma exposure by strike and should be interpreted as an approximate positioning level.
+            Expected move uses ATM IV and the square-root-of-time approximation.
+        </p>
 
         <p style="font-size: 12px; color: #666;">
             Automated report generated from your Neon PostgreSQL options database.
@@ -1041,11 +1644,11 @@ def main():
 
     today = datetime.now().strftime("%Y-%m-%d")
     subject_symbols = ", ".join([m["symbol"] for m in all_metrics])
-    subject = f"Daily Options Report — {subject_symbols} — {today}"
+    subject = f"Daily Options Intelligence Report — {subject_symbols} — {today}"
 
     send_email(subject, html)
 
-    print("Daily options report sent successfully.")
+    print("Daily options intelligence report sent successfully.")
     print(f"Symbols included: {subject_symbols}")
 
 
